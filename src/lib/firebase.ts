@@ -1,0 +1,264 @@
+import { initializeApp } from "firebase/app";
+import { 
+  getAuth, 
+  signInWithEmailAndPassword, 
+  createUserWithEmailAndPassword, 
+  signOut, 
+  onAuthStateChanged,
+  signInWithPopup,
+  GoogleAuthProvider,
+  User as FirebaseUser,
+  RecaptchaVerifier,
+  signInWithPhoneNumber,
+  updateProfile,
+  sendEmailVerification,
+  sendPasswordResetEmail,
+  updatePassword,
+  EmailAuthProvider,
+  reauthenticateWithCredential
+} from "firebase/auth";
+import { getStorage, ref, uploadBytes, getDownloadURL } from "firebase/storage";
+import { 
+  getFirestore, 
+  initializeFirestore,
+  persistentLocalCache,
+  persistentMultipleTabManager,
+  memoryLocalCache,
+  setLogLevel,
+  collection, 
+  doc, 
+  getDoc, 
+  getDocFromServer,
+  setDoc, 
+  getDocs, 
+  query, 
+  where, 
+  or,
+  addDoc, 
+  updateDoc, 
+  deleteDoc, 
+  increment,
+  Timestamp,
+  serverTimestamp,
+  orderBy,
+  limit,
+  onSnapshot,
+  writeBatch,
+  runTransaction,
+  arrayUnion
+} from "firebase/firestore";
+import config from "../../firebase-applet-config.json";
+
+// Configure Firestore log level to silent to prevent benign offline/handshake warning spam
+setLogLevel("silent");
+
+// Initialize Firebase App strictly using firebase-applet-config.json as the single source of truth
+const firebaseConfig = {
+  apiKey: config.apiKey,
+  authDomain: config.authDomain,
+  projectId: config.projectId,
+  storageBucket: config.storageBucket,
+  messagingSenderId: config.messagingSenderId,
+  appId: config.appId
+};
+
+const app = initializeApp(firebaseConfig);
+const auth = getAuth(app);
+
+// Initialize Firestore strictly from firebase-applet-config.json configuration
+const firestoreDbId = config.firestoreDatabaseId || "(default)";
+const db = getFirestore(app, firestoreDbId);
+
+const googleProvider = new GoogleAuthProvider();
+googleProvider.setCustomParameters({
+  prompt: 'select_account'
+});
+const storage = getStorage(app);
+
+export { 
+  app, 
+  auth, 
+  db, 
+  storage,
+  getStorage,
+  ref,
+  uploadBytes,
+  getDownloadURL,
+  updateProfile,
+  sendEmailVerification,
+  googleProvider,
+  signInWithPopup,
+  signInWithEmailAndPassword,
+  createUserWithEmailAndPassword,
+  signOut,
+  onAuthStateChanged,
+  collection,
+  doc,
+  getDoc,
+  getDocFromServer,
+  setDoc,
+  getDocs,
+  query,
+  where,
+  or,
+  addDoc,
+  updateDoc,
+  deleteDoc,
+  increment,
+  Timestamp,
+  serverTimestamp,
+  orderBy,
+  limit,
+  onSnapshot,
+  writeBatch,
+  runTransaction,
+  arrayUnion,
+  RecaptchaVerifier,
+  signInWithPhoneNumber,
+  sendPasswordResetEmail,
+  updatePassword,
+  EmailAuthProvider,
+  reauthenticateWithCredential
+};
+
+// Seeding function to populate categories, products, settings, and coupons if they are empty
+export async function seedDatabase(initialCategories: any[], initialProducts: any[]) {
+  try {
+    // 1. Seed categories only if empty or missing some categories (ensure all 19 categories are always in Firestore)
+    const catsSnap = await getDocs(collection(db, "categories"));
+    const dbCatIds = new Set(catsSnap.docs.map(doc => doc.id));
+    const missingCats = initialCategories.filter(cat => cat.id !== "all" && !dbCatIds.has(cat.id));
+
+    if (missingCats.length > 0) {
+      console.log(`Seeding/updating ${missingCats.length} missing categories...`);
+      for (const cat of missingCats) {
+        await setDoc(doc(db, "categories", cat.id), {
+          id: cat.id,
+          nameBn: cat.nameBn,
+          nameEn: cat.nameEn,
+          iconName: cat.iconName,
+          colorClass: cat.colorClass,
+          borderColor: cat.borderColor
+        }, { merge: true });
+      }
+    }
+
+    // 2. Check if products already seeded
+    const prodsSnap = await getDocs(collection(db, "products"));
+    if (prodsSnap.empty) {
+      console.log("Seeding products...");
+      for (const prod of initialProducts) {
+        await setDoc(doc(db, "products", prod.id.toString()), {
+          id: prod.id.toString(),
+          nameBn: prod.nameBn,
+          nameEn: prod.nameEn,
+          price: prod.price,
+          originalPrice: prod.originalPrice || null,
+          unitBn: prod.unitBn,
+          unitEn: prod.unitEn,
+          category: prod.category,
+          image: prod.image,
+          isFlashSale: prod.isFlashSale || false,
+          discount: prod.discount || 0,
+          rating: prod.rating || 4.5,
+          stock: prod.stock || 50,
+          descriptionBn: prod.descriptionBn || "",
+          descriptionEn: prod.descriptionEn || "",
+          isBestSelling: prod.isBestSelling || false,
+          isNewArrival: prod.isNewArrival || false,
+          isPopular: prod.isPopular || false,
+          isSeasonal: prod.isSeasonal || false,
+          isCombo: prod.isCombo || false,
+          isBuyMoreSaveMore: prod.isBuyMoreSaveMore || false,
+          brand: prod.brand || "Kacha Bazar",
+          reviewCount: prod.reviewCount || 1,
+          sellerId: "admin" // admin/system products by default
+        });
+      }
+    }
+
+    // 3. Seed dynamic settings if empty
+    const settingsSnap = await getDoc(doc(db, "settings", "global"));
+    if (!settingsSnap.exists()) {
+      console.log("Seeding settings...");
+      await setDoc(doc(db, "settings", "global"), {
+        id: "global",
+        deliveryCharge: 45,
+        freeDeliveryThreshold: 500,
+        referralBonusAmount: 50,
+        bKashNumber: "01700000000",
+        nagadNumber: "01800000000",
+        rocketNumber: "01900000000"
+      });
+    }
+
+    // 4. Seed coupons if empty
+    const couponsSnap = await getDocs(collection(db, "coupons"));
+    if (couponsSnap.empty) {
+      console.log("Seeding coupons...");
+      const defaultCoupons = [
+        { code: "KACHA50", discountAmount: 50, minOrderAmount: 300, isActive: true },
+        { code: "EID2026", discountAmount: 100, minOrderAmount: 600, isActive: true },
+        { code: "FREESHIP", discountAmount: 45, minOrderAmount: 400, isActive: true }
+      ];
+      for (const cop of defaultCoupons) {
+        await setDoc(doc(db, "coupons", cop.code), {
+          ...cop,
+          expiryDate: Timestamp.fromDate(new Date(Date.now() + 30 * 24 * 60 * 60 * 1000))
+        });
+      }
+    }
+
+    // 5. Ensure Pharmacy category exists and old baby care products are removed
+    await setDoc(doc(db, "categories", "pharmacy"), {
+      id: "pharmacy",
+      nameBn: "ফার্মেসি",
+      nameEn: "Pharmacy",
+      iconName: "Pill",
+      colorClass: "bg-teal-50 text-teal-700 hover:bg-teal-100",
+      borderColor: "border-teal-100",
+      displayOrder: 12,
+      order: 12,
+      isAvailable: true
+    }, { merge: true }).catch(() => {});
+
+    // Ensure pharmacy products are seeded
+    const phCheck = await getDoc(doc(db, "products", "ph1"));
+    if (!phCheck.exists()) {
+      const pharmacyProds = initialProducts.filter(p => p.category === "pharmacy");
+      for (const prod of pharmacyProds) {
+        await setDoc(doc(db, "products", prod.id.toString()), {
+          ...prod,
+          isAvailable: true,
+          status: "active"
+        }, { merge: true }).catch(() => {});
+      }
+    }
+
+    // 6. Ensure Live Notice / Announcement document exists
+    const noticeSnap = await getDoc(doc(db, "settings", "notice"));
+    if (!noticeSnap.exists()) {
+      await setDoc(doc(db, "settings", "notice"), {
+        isActive: true,
+        badgeBn: "🔴 LIVE UPDATE",
+        badgeEn: "🔴 LIVE UPDATE",
+        titleBn: "কাঁচা বাজার ওয়েবসাইটের কাজ এখনও চলমান।",
+        titleEn: "Kacha Bazar website is currently under development.",
+        messageBn: "বর্তমানে অর্ডার গ্রহণ শুরু হয়নি। খুব শীঘ্রই অর্ডার নেওয়া শুরু হবে।",
+        messageEn: "Orders are not currently being accepted. We will start taking orders very soon.",
+        theme: "rose",
+        showDotPulse: true,
+        orderDisabled: true,
+        createdAt: new Date().toISOString()
+      }, { merge: true }).catch(() => {});
+    }
+
+    console.log("Database seed check completed successfully!");
+  } catch (err: any) {
+    if (err && (err.code === "permission-denied" || err.message?.includes("permissions"))) {
+      console.log("Database seeding skipped: User lacks write permissions.");
+    } else {
+      console.error("Error seeding database: ", err);
+    }
+  }
+}

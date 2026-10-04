@@ -1,0 +1,415 @@
+import React, { useState, useEffect, useRef } from "react";
+import { motion, AnimatePresence } from "motion/react";
+import { Gift, ArrowRight, ArrowLeft, Zap, Sparkles, Percent, Award, Share2 } from "lucide-react";
+import { toBnNum, fmtNum as formatNumber } from "../lib/formatUtils";
+
+interface BannerSliderProps {
+  lang: "bn" | "en";
+  loggedInUser: any;
+  userReferralCode: string;
+  timeLeft: { hours: number; minutes: number; seconds: number };
+  onReferralClick: () => void;
+  onFlashSaleClick: () => void;
+  onCategoryClick?: (categoryId: string) => void;
+  customBanners?: any[];
+  referralBanner?: any;
+  loading?: boolean;
+}
+
+export const BannerSlider: React.FC<BannerSliderProps> = ({
+  lang,
+  loggedInUser,
+  userReferralCode,
+  timeLeft,
+  onReferralClick,
+  onFlashSaleClick,
+  onCategoryClick,
+  customBanners = [],
+  referralBanner,
+  loading = false
+}) => {
+  const [activeIndex, setActiveIndex] = useState(0);
+  const [direction, setDirection] = useState<number>(1);
+
+  const fmtNum = (num: number | string): string => formatNumber(num, lang);
+
+  // Render sleek, compact banner height (reduced by ~50% for optimal balance)
+  const containerHeightClass = "h-[85px] sm:h-[100px] md:h-[110px]";
+
+  // Existing App Referral Banner definition from configuration
+  const referralSlide = {
+    id: "app-referral-banner",
+    type: "referral",
+    titleBn: referralBanner?.titleBn || "🎉 বন্ধুকে রেফার করুন! ৳১৯ বোনাস পান",
+    titleEn: referralBanner?.titleEn || "🎉 Refer Friends, Earn ৳19 Wallet Bonus!",
+    subtitleBn: referralBanner?.descBn || "বন্ধুকে রেফার করুন! আপনার বন্ধু রেফারেল কোড ব্যবহার করে সাইন আপ করে মোট কমপক্ষে ৳৩০০ টাকার সফল (Delivered) অর্ডার সম্পন্ন করলে আপনি আপনার Wallet-এ ৳১৯ বোনাস পাবেন।",
+    subtitleEn: referralBanner?.descEn || "Refer friends! When your friend signs up and completes ৳300+ delivered orders, you get ৳19 bonus in your Wallet.",
+    buttonTextBn: referralBanner?.buttonTextBn || "রেফার করুন",
+    buttonTextEn: referralBanner?.buttonTextEn || "Refer Now",
+    isActive: referralBanner?.enabled !== false
+  };
+
+  // Combine dynamic custom banners with the existing App Referral Banner
+  const activeCustomBanners = customBanners.filter(b => b.isActive !== false);
+  const hasExistingReferral = activeCustomBanners.some(b => b.type === "referral" || b.id === "app-referral-banner");
+
+  const slides = [
+    ...activeCustomBanners,
+    ...(!hasExistingReferral && referralSlide.isActive ? [referralSlide] : [])
+  ];
+  const totalSlides = slides.length;
+
+  // Safeguard activeIndex if banners array changes dynamically
+  useEffect(() => {
+    if (activeIndex >= totalSlides && totalSlides > 0) {
+      setActiveIndex(0);
+    }
+  }, [totalSlides, activeIndex]);
+
+  const nextSlide = () => {
+    if (totalSlides <= 1) return;
+    setDirection(1);
+    setActiveIndex((prev) => (prev + 1) % totalSlides);
+  };
+
+  const prevSlide = () => {
+    if (totalSlides <= 1) return;
+    setDirection(-1);
+    setActiveIndex((prev) => (prev - 1 + totalSlides) % totalSlides);
+  };
+
+  const goToSlide = (index: number) => {
+    if (index === activeIndex) return;
+    setDirection(index > activeIndex ? 1 : -1);
+    setActiveIndex(index);
+  };
+
+  // Automatic sliding every 3 seconds for all existing and future banners
+  useEffect(() => {
+    if (totalSlides <= 1) return;
+
+    const interval = setInterval(() => {
+      if (document.hidden) return;
+      setDirection(1);
+      setActiveIndex((prev) => (prev + 1) % totalSlides);
+    }, 3000);
+
+    return () => clearInterval(interval);
+  }, [totalSlides, activeIndex]);
+
+  // Mobile touch swipe handling
+  const touchStartX = useRef<number | null>(null);
+  const touchStartY = useRef<number | null>(null);
+  const hasSwipedRecently = useRef<boolean>(false);
+
+  const handleTouchStart = (e: React.TouchEvent) => {
+    touchStartX.current = e.touches[0].clientX;
+    touchStartY.current = e.touches[0].clientY;
+  };
+
+  const handleTouchEnd = (e: React.TouchEvent) => {
+    if (touchStartX.current === null || touchStartY.current === null) return;
+    const touchEndX = e.changedTouches[0].clientX;
+    const touchEndY = e.changedTouches[0].clientY;
+    const diffX = touchStartX.current - touchEndX;
+    const diffY = touchStartY.current - touchEndY;
+
+    const minSwipeDistance = 35; // px threshold for intentional swipe
+
+    // Ensure swipe was predominantly horizontal so vertical page scroll is unaffected
+    if (Math.abs(diffX) > minSwipeDistance && Math.abs(diffX) > Math.abs(diffY)) {
+      hasSwipedRecently.current = true;
+      setTimeout(() => {
+        hasSwipedRecently.current = false;
+      }, 200);
+
+      if (diffX > 0) {
+        // Swiped left -> next banner
+        nextSlide();
+      } else {
+        // Swiped right -> previous banner
+        prevSlide();
+      }
+    }
+
+    touchStartX.current = null;
+    touchStartY.current = null;
+  };
+
+  // Safe click handler preventing unintentional clicks during swipe gesture
+  const handleItemClick = (action?: () => void) => {
+    if (hasSwipedRecently.current) return;
+    action?.();
+  };
+
+  // If loading banners from Firebase, show a sleek skeleton
+  if (loading) {
+    return (
+      <section className="max-w-7xl mx-auto px-4 mt-3 relative">
+        <div 
+          className={`w-full relative rounded-2xl overflow-hidden shadow-xs border border-slate-100 bg-slate-100 animate-pulse ${containerHeightClass}`}
+        >
+          <div className="w-full h-full flex items-center justify-between p-3 sm:p-4 bg-gradient-to-r from-slate-200/60 via-slate-100 to-slate-200/60">
+            <div className="space-y-1.5 max-w-[65%]">
+              <div className="h-2.5 w-20 bg-slate-300/70 rounded-md"></div>
+              <div className="h-4 sm:h-5 w-44 sm:w-72 bg-slate-300/80 rounded-lg"></div>
+              <div className="h-2.5 w-32 sm:w-48 bg-slate-300/60 rounded-md"></div>
+            </div>
+            <div className="h-7 sm:h-8 w-20 bg-slate-300/70 rounded-xl"></div>
+          </div>
+        </div>
+      </section>
+    );
+  }
+
+  // If no banners configured in Firebase, do not show hard-coded fallback banners
+  if (activeCustomBanners.length === 0) {
+    return null;
+  }
+
+  // Smooth directional sliding animation variants
+  const slideVariants = {
+    enter: (dir: number) => ({
+      x: dir > 0 ? "100%" : "-100%",
+      opacity: 0,
+    }),
+    center: {
+      x: 0,
+      opacity: 1,
+    },
+    exit: (dir: number) => ({
+      x: dir > 0 ? "-100%" : "100%",
+      opacity: 0,
+    }),
+  };
+
+  return (
+    <section className="max-w-7xl mx-auto px-4 mt-3 relative">
+      {/* Slider Container with smooth height transition & touch action */}
+      <div 
+        className={`w-full relative rounded-2xl overflow-hidden shadow-xs transition-all duration-300 ease-out border border-slate-100 select-none ${containerHeightClass}`}
+        id="home-banner-slider"
+        style={{ touchAction: "pan-y" }}
+        onTouchStart={handleTouchStart}
+        onTouchEnd={handleTouchEnd}
+      >
+        {/* Navigation Buttons (visible when more than 1 slide) */}
+        {totalSlides > 1 && (
+          <>
+            <button
+              onClick={(e) => {
+                e.stopPropagation();
+                prevSlide();
+              }}
+              className="absolute left-2 top-1/2 -translate-y-1/2 z-20 w-6 h-6 sm:w-7 sm:h-7 rounded-full bg-black/35 hover:bg-black/60 text-white flex items-center justify-center transition backdrop-blur-xs focus:outline-none cursor-pointer shadow-xs"
+              aria-label="Previous slide"
+              id="btn-slider-prev"
+            >
+              <ArrowLeft className="w-3.5 h-3.5" />
+            </button>
+
+            <button
+              onClick={(e) => {
+                e.stopPropagation();
+                nextSlide();
+              }}
+              className="absolute right-2 top-1/2 -translate-y-1/2 z-20 w-6 h-6 sm:w-7 sm:h-7 rounded-full bg-black/35 hover:bg-black/60 text-white flex items-center justify-center transition backdrop-blur-xs focus:outline-none cursor-pointer shadow-xs"
+              aria-label="Next slide"
+              id="btn-slider-next"
+            >
+              <ArrowRight className="w-3.5 h-3.5" />
+            </button>
+          </>
+        )}
+
+        <AnimatePresence initial={false} custom={direction} mode="popLayout">
+          <motion.div
+            key={activeIndex}
+            custom={direction}
+            variants={slideVariants}
+            initial="enter"
+            animate="center"
+            exit="exit"
+            transition={{
+              x: { type: "tween", ease: [0.25, 1, 0.5, 1], duration: 0.45 },
+              opacity: { duration: 0.25 }
+            }}
+            className="w-full h-full"
+          >
+            {(() => {
+              const slide = slides[activeIndex];
+              if (!slide) return null;
+
+              // Referral Banner
+              if (slide.type === "referral") {
+                return (
+                  <div 
+                    onClick={() => handleItemClick(onReferralClick)}
+                    className="w-full h-full bg-gradient-to-r from-emerald-950 via-emerald-800 to-teal-950 text-white px-3.5 sm:px-6 py-2 sm:py-3 flex items-center justify-between relative overflow-hidden cursor-pointer select-none"
+                  >
+                    <div className="absolute top-0 right-0 w-36 h-36 bg-emerald-400/10 rounded-full blur-xl pointer-events-none"></div>
+                    
+                    <div className="z-10 space-y-0.5 sm:space-y-1 max-w-[70%]">
+                      <div className="flex items-center space-x-1.5">
+                        <span className="bg-emerald-500/20 border border-emerald-500/30 px-1.5 py-0.2 rounded text-[7.5px] sm:text-[9px] font-bold tracking-wider text-emerald-300 uppercase">
+                          {lang === "bn" ? "আমন্ত্রণ ও পুরস্কার" : "REFERRAL REWARD"}
+                        </span>
+                        {userReferralCode && (
+                          <span className="bg-white/10 border border-white/20 rounded px-1.5 py-0.2 text-[7.5px] sm:text-[9px] font-mono font-bold tracking-wider text-yellow-300">
+                            {userReferralCode}
+                          </span>
+                        )}
+                      </div>
+                      
+                      <h3 className="text-xs sm:text-sm md:text-base font-extrabold text-white leading-snug line-clamp-1">
+                        {lang === "bn" 
+                          ? (slide.titleBn || "🎉 বন্ধুকে রেফার করুন! ৳১৯ বোনাস পান") 
+                          : (slide.titleEn || "🎉 Refer Friends, Earn ৳19 Wallet Bonus!")}
+                      </h3>
+                      
+                      <p className="text-[9px] sm:text-[11px] text-emerald-100/90 font-medium truncate">
+                        {lang === "bn"
+                          ? (slide.subtitleBn || "বন্ধুকে রেফার করুন! আপনার বন্ধু রেফারেল কোড ব্যবহার করে সাইন আপ করে মোট কমপক্ষে ৳৩০০ টাকার সফল (Delivered) অর্ডার সম্পন্ন করলে আপনি আপনার Wallet-এ ৳১৯ বোনাস পাবেন।")
+                          : (slide.subtitleEn || "Refer friends! When your friend signs up and completes ৳300+ delivered orders, you get ৳19 bonus in your Wallet.")}
+                      </p>
+                    </div>
+
+                    <div className="z-10 shrink-0 flex flex-col items-end gap-1">
+                      <button 
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          handleItemClick(onReferralClick);
+                        }}
+                        className="bg-gradient-to-r from-yellow-400 to-amber-400 hover:from-yellow-300 hover:to-amber-300 text-slate-950 px-2.5 sm:px-3 py-1 sm:py-1.2 rounded-lg text-[9px] sm:text-[11px] font-black transition-all duration-300 flex items-center space-x-1 shadow hover:scale-105 active:scale-95 cursor-pointer"
+                      >
+                        <span>{lang === "bn" ? "রেফার করুন" : "Refer Now"}</span>
+                        <ArrowRight className="w-2.5 h-2.5 sm:w-3 sm:h-3" />
+                      </button>
+                      <span className="text-[7.5px] sm:text-[9px] text-emerald-200/80 font-medium">
+                        {lang === "bn" ? "*শর্ত প্রযোজ্য" : "*T&C Apply"}
+                      </span>
+                    </div>
+                  </div>
+                );
+              }
+
+              // Flash Sale Banner
+              if (slide.type === "flash") {
+                return (
+                  <div 
+                    onClick={() => handleItemClick(onFlashSaleClick)}
+                    className="w-full h-full bg-gradient-to-r from-rose-800 via-red-600 to-orange-600 text-white px-3.5 sm:px-6 py-2 sm:py-3 flex items-center justify-between relative overflow-hidden cursor-pointer select-none"
+                  >
+                    <div className="z-10 space-y-0.5 sm:space-y-1 max-w-[65%]">
+                      <div className="flex items-center space-x-1">
+                        <span className="bg-black/40 border border-red-400/40 px-1.5 py-0.2 rounded text-[7.5px] sm:text-[9px] font-bold tracking-wider text-yellow-300 uppercase flex items-center gap-1 animate-pulse">
+                          <Zap className="w-2.5 h-2.5 sm:w-3 sm:h-3 text-yellow-300 fill-yellow-300" />
+                          <span>{lang === "bn" ? "সীমিত অফার" : "FLASH SALE"}</span>
+                        </span>
+                      </div>
+                      <h3 className="text-xs sm:text-sm md:text-base font-extrabold text-white leading-snug line-clamp-1">
+                        {lang === "bn" ? (slide.titleBn || "⚡ ফ্ল্যাশ সেল মেগা অফার চলছে!") : (slide.titleEn || "⚡ Flash Sale Megadeal is LIVE!")}
+                      </h3>
+                      <p className="text-[9px] sm:text-[11px] text-rose-100 font-medium truncate">
+                        {lang === "bn" ? (slide.subtitleBn || "সেরা মূল্যে সতেজ পণ্য স্টক ফুরানোর আগেই কিনে নিন") : (slide.subtitleEn || "Unbeatable prices on organic foods.")}
+                      </p>
+                    </div>
+
+                    <div className="z-10 flex flex-col items-end shrink-0 bg-black/30 backdrop-blur-xs px-2 py-1 rounded-xl border border-white/10">
+                      <span className="text-[7.5px] sm:text-[9px] font-bold text-rose-200 uppercase tracking-wider">
+                        {lang === "bn" ? "সময় বাকি:" : "ENDS IN:"}
+                      </span>
+                      <div className="flex items-center space-x-0.5 text-[10px] sm:text-xs font-black text-yellow-300 font-mono mt-0.5">
+                        <span className="bg-white/10 px-1 py-0.2 rounded">{fmtNum(timeLeft.hours.toString().padStart(2, "0"))}</span>
+                        <span>:</span>
+                        <span className="bg-white/10 px-1 py-0.2 rounded">{fmtNum(timeLeft.minutes.toString().padStart(2, "0"))}</span>
+                        <span>:</span>
+                        <span className="bg-white/10 px-1 py-0.2 rounded">{fmtNum(timeLeft.seconds.toString().padStart(2, "0"))}</span>
+                      </div>
+                    </div>
+                  </div>
+                );
+              }
+
+              // Dynamic Custom Banner from Firebase Firestore
+              return (
+                <div 
+                  onClick={() => {
+                    handleItemClick(() => {
+                      if (slide.link) {
+                        if (slide.link.startsWith("category:")) {
+                          const targetCat = slide.link.replace("category:", "");
+                          onCategoryClick?.(targetCat);
+                        }
+                      }
+                    });
+                  }}
+                  className={`w-full h-full bg-gradient-to-r ${slide.bgGradient || "from-emerald-800 via-teal-700 to-emerald-900"} text-white px-3.5 sm:px-6 py-2 sm:py-3 flex items-center justify-between relative overflow-hidden select-none cursor-pointer`}
+                >
+                  {slide.image && (
+                    <div 
+                      className="absolute right-0 top-0 bottom-0 w-1/3 opacity-25 pointer-events-none bg-cover bg-center" 
+                      style={{ backgroundImage: `url(${slide.image})` }}
+                    ></div>
+                  )}
+                  <div className="z-10 space-y-0.5 sm:space-y-1 max-w-[70%]">
+                    {(slide.tagEn || slide.tagBn) && (
+                      <span className="bg-black/30 border border-white/20 px-1.5 py-0.2 rounded text-[7.5px] sm:text-[9px] font-bold tracking-wider text-emerald-200 uppercase">
+                        {lang === "bn" ? slide.tagBn || slide.tagEn : slide.tagEn || slide.tagBn}
+                      </span>
+                    )}
+                    <h3 className="text-xs sm:text-sm md:text-base font-extrabold text-white leading-snug line-clamp-1">
+                      {lang === "bn" ? slide.titleBn || slide.titleEn : slide.titleEn || slide.titleBn}
+                    </h3>
+                    {(slide.subtitleBn || slide.subtitleEn) && (
+                      <p className="text-[9px] sm:text-[11px] text-slate-100 font-medium truncate">
+                        {lang === "bn" ? slide.subtitleBn || slide.subtitleEn : slide.subtitleEn || slide.subtitleBn}
+                      </p>
+                    )}
+                    {(slide.highlightBn || slide.highlightEn) && (
+                      <span className="text-[9px] sm:text-[11px] text-yellow-300 font-bold block">
+                        {lang === "bn" ? slide.highlightBn || slide.highlightEn : slide.highlightEn || slide.highlightBn}
+                      </span>
+                    )}
+                  </div>
+                  <div className="z-10 shrink-0">
+                    <div className="bg-white text-emerald-900 px-2.5 sm:px-3 py-1 sm:py-1.2 rounded-lg text-[9px] sm:text-[11px] font-black shadow hover:bg-emerald-50 transition cursor-pointer flex items-center gap-1">
+                      <span>
+                        {lang === "bn" 
+                          ? (slide.buttonTextBn || "কিনুন") 
+                          : (slide.buttonTextEn || "Shop Now")}
+                      </span>
+                      <ArrowRight className="w-2.5 h-2.5 sm:w-3 sm:h-3" />
+                    </div>
+                  </div>
+                </div>
+              );
+            })()}
+          </motion.div>
+        </AnimatePresence>
+
+        {/* Circular Bottom Dot Indicators */}
+        {totalSlides > 1 && (
+          <div className="absolute bottom-1.5 left-1/2 -translate-x-1/2 z-20 flex space-x-1.5">
+            {slides.map((_, i) => (
+              <button
+                key={i}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  goToSlide(i);
+                }}
+                className={`w-1.5 h-1.5 rounded-full transition-all duration-300 focus:outline-none cursor-pointer ${
+                  i === activeIndex 
+                    ? "bg-white w-4" 
+                    : "bg-white/40 hover:bg-white/60"
+                }`}
+                aria-label={`Go to slide ${i + 1}`}
+                id={`btn-dot-${i}`}
+              ></button>
+            ))}
+          </div>
+        )}
+      </div>
+    </section>
+  );
+};

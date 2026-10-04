@@ -1,0 +1,3263 @@
+import React, { useState, useRef, useEffect } from "react";
+import { createPortal } from "react-dom";
+import { 
+  Plus, Edit, Trash2, Upload, Download, Check, X, RefreshCw, 
+  Layers, ChevronRight, FileText, ImageIcon, ArrowUp, ArrowDown,
+  Eye, EyeOff, Search, Filter, CheckCircle2, XCircle, Salad,
+  Grid, Tag, Settings, Sparkles, Package, FolderPlus, Flame, Coffee, Apple, Milk, ShoppingBag, Sliders, Fish, Pill
+} from "lucide-react";
+import { db, doc, setDoc, updateDoc, deleteDoc, collection, addDoc, serverTimestamp } from "../../lib/firebase";
+import { ProductOption, Subcategory } from "../../types";
+import { 
+  subscribeToAllSubcategories, 
+  updateSubcategoryOrder, 
+  saveSubcategory, 
+  softDeleteSubcategory, 
+  bootstrapInitialSubcategoriesIfNeeded 
+} from "../../lib/subcategoryService";
+import DeleteProductConfirmModal from "./DeleteProductConfirmModal";
+import { isCategoryMatch, normalizeCategoryId, shouldKeepProductGroceryFiltered } from "../../lib/categoryUtils";
+import { matchesProductSearch } from "../../lib/banglishSearch";
+import { DRY_FOOD_RAW, PHARMACY_PRODUCTS_RAW, GROCERY_SUBCATEGORY_MAP, GROCERY_ORDER_MAP, GROCERY_SECTIONS, GROCERY_PRODUCTS_RAW, getResolvedGrocerySubcategory, getResolvedGroceryDisplayOrder, ALL_PRODUCTS } from "../../data";
+import { resolveProductUnit } from "../../lib/productWeightUtils";
+import { RESTAURANT_SUBCATEGORIES, getResolvedRestaurantSubcategory } from "../../lib/restaurantSubcategories";
+import { uploadImageWithFallback } from "../../lib/imageUploadHelper";
+import { SAFE_PRODUCT_PLACEHOLDER } from "../../lib/masterImageRegistry";
+import { createTranslator } from "../../lib/formatUtils";
+import { apiClient } from "../../lib/apiClient";
+
+interface AdminProductsTabProps {
+  products: any[];
+  categories: any[];
+  orders?: any[];
+  user?: any;
+  lang: "bn" | "en";
+  triggerToast: (bn: string, en: string) => void;
+  onProductSaved?: (product: any) => void;
+}
+
+export default function AdminProductsTab({ products, categories, orders = [], user, lang, triggerToast, onProductSaved }: AdminProductsTabProps) {
+  const getTranslation = createTranslator(lang);
+
+  // Delete Confirmation Modal state & optimistically deleted products set
+  const [productPendingDelete, setProductPendingDelete] = useState<any | null>(null);
+  const [deletedProductIds, setDeletedProductIds] = useState<Set<string>>(() => {
+    try {
+      const saved = localStorage.getItem("kb_deleted_products");
+      return saved ? new Set(JSON.parse(saved)) : new Set();
+    } catch {
+      return new Set();
+    }
+  });
+
+  const isProductDeleted = (p: any) => {
+    return deletedProductIds.has(p.id) || p.isDeleted === true || p.status === "deleted" || p.status === "inactive_deleted" || p.deleted === true || /^sn\d+$/i.test(p.id);
+  };
+
+  const handleDeleteSuccess = (deletedId: string) => {
+    setDeletedProductIds(prev => {
+      const next = new Set(prev).add(deletedId);
+      try {
+        localStorage.setItem("kb_deleted_products", JSON.stringify(Array.from(next)));
+      } catch {}
+      return next;
+    });
+  };
+
+  // Subtab navigation: "category_manager" is the default subtab for focused category & product management
+  const [activeCatalogSubTab, setActiveCatalogSubTab] = useState<"category_manager" | "products" | "categories" | "subcategories" | "bulk">("category_manager");
+
+  // Subcategories Real-Time State & Ordering Management
+  const [subcategories, setSubcategories] = useState<Subcategory[]>([]);
+  const [selectedSubcatCategoryFilter, setSelectedSubcatCategoryFilter] = useState<string>("all");
+  const [showSubcategoryModal, setShowSubcategoryModal] = useState<boolean>(false);
+  const [editingSubcategory, setEditingSubcategory] = useState<Subcategory | null>(null);
+  const [subModalCategoryId, setSubModalCategoryId] = useState<string>("groceries");
+  const [subModalNameBn, setSubModalNameBn] = useState<string>("");
+  const [subModalNameEn, setSubModalNameEn] = useState<string>("");
+  const [subModalOrder, setSubModalOrder] = useState<number>(1);
+  const [savingSubModal, setSavingSubModal] = useState<boolean>(false);
+
+  // Selected Category ID for Category Manager view (defaults to "vegetables" - তাজা শাক ও সবজি)
+  const [selectedCatId, setSelectedCatId] = useState<string>("vegetables");
+
+  // Search & Filter state
+  const [searchTerm, setSearchTerm] = useState<string>("");
+  const [catProductSearchTerm, setCatProductSearchTerm] = useState<string>("");
+  const [catProductStatusFilter, setCatProductStatusFilter] = useState<"all" | "active" | "disabled" | "low_stock">("all");
+
+  // Form states for Product
+  const [showProductForm, setShowProductForm] = useState<boolean>(false);
+  const [editingProduct, setEditingProduct] = useState<any | null>(null);
+  const [prodId, setProdId] = useState<string>("");
+  const [prodNameEn, setProdNameEn] = useState<string>("");
+  const [prodNameBn, setProdNameBn] = useState<string>("");
+  const [prodPrice, setProdPrice] = useState<number>(0);
+  const [prodOrigPrice, setProdOrigPrice] = useState<number>(0);
+  const [prodUnitEn, setProdUnitEn] = useState<string>("");
+  const [prodUnitBn, setProdUnitBn] = useState<string>("");
+  const [prodCategory, setProdCategory] = useState<string>("");
+  const [prodSubcategoryId, setProdSubcategoryId] = useState<string>("");
+  const [prodSubcategory, setProdSubcategory] = useState<string>("");
+  const [prodStock, setProdStock] = useState<number>(10);
+  const [prodImage, setProdImage] = useState<string>("");
+  const [prodDescEn, setProdDescEn] = useState<string>("");
+  const [prodDescBn, setProdDescBn] = useState<string>("");
+  const [prodBrand, setProdBrand] = useState<string>("");
+  const [prodSku, setProdSku] = useState<string>("");
+  const [prodOptions, setProdOptions] = useState<ProductOption[]>([]);
+  const [prodIsAvailable, setProdIsAvailable] = useState<boolean>(true);
+  const [prodDisplayOrder, setProdDisplayOrder] = useState<number>(0);
+  const [newOptValue, setNewOptValue] = useState<string>("");
+  const [newOptUnit, setNewOptUnit] = useState<string>("g");
+  const [newOptPrice, setNewOptPrice] = useState<string>("");
+  const [newOptStock, setNewOptStock] = useState<string>("");
+  const [savingProduct, setSavingProduct] = useState<boolean>(false);
+  
+  // Image Upload helper for Product
+  const [uploadingImage, setUploadingImage] = useState<boolean>(false);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
+  // Category Editor state
+  const [catNameBn, setCatNameBn] = useState<string>("");
+  const [catNameEn, setCatNameEn] = useState<string>("");
+  const [catIcon, setCatIcon] = useState<string>("Salad");
+  const [catImage, setCatImage] = useState<string>("");
+  const [catColor, setCatColor] = useState<string>("bg-emerald-50 text-emerald-700");
+  const [catBorder, setCatBorder] = useState<string>("border-emerald-100");
+  const [savingCategory, setSavingCategory] = useState<boolean>(false);
+  const [uploadingCatImage, setUploadingCatImage] = useState<boolean>(false);
+  const catFileInputRef = useRef<HTMLInputElement>(null);
+  const lastSavedCategoryImages = useRef<Record<string, string>>({});
+
+  // General Category Modal state (for creating/editing category in "categories" subtab)
+  const [showCategoryModal, setShowCategoryModal] = useState<boolean>(false);
+  const [editingCategoryModal, setEditingCategoryModal] = useState<any | null>(null);
+  const [modalCatId, setModalCatId] = useState<string>("");
+  const [modalCatNameBn, setModalCatNameBn] = useState<string>("");
+  const [modalCatNameEn, setModalCatNameEn] = useState<string>("");
+  const [modalCatIcon, setModalCatIcon] = useState<string>("Salad");
+  const [modalCatImage, setModalCatImage] = useState<string>("");
+  const [modalCatColor, setModalCatColor] = useState<string>("bg-emerald-50 text-emerald-700");
+  const [modalCatBorder, setModalCatBorder] = useState<string>("border-emerald-100");
+  const [modalCatIsAvailable, setModalCatIsAvailable] = useState<boolean>(true);
+  const [modalCatDisplayOrder, setModalCatDisplayOrder] = useState<number>(0);
+  const [savingCategoryModal, setSavingCategoryModal] = useState<boolean>(false);
+  const [uploadingModalCatImage, setUploadingModalCatImage] = useState<boolean>(false);
+  const modalCatFileInputRef = useRef<HTMLInputElement>(null);
+
+  // Search & Filter for All Categories Subtab
+  const [catSearchTerm, setCatSearchTerm] = useState<string>("");
+  const [catStatusFilter, setCatStatusFilter] = useState<"all" | "active" | "disabled">("all");
+
+  // Bulk CSV state
+  const [bulkCsvText, setBulkCsvText] = useState<string>("");
+  const [importingBulk, setImportingBulk] = useState<boolean>(false);
+
+  // One-time automatic sync for Dry Food category, Restaurant (#3) & Confectionery (#5) in Firestore
+  useEffect(() => {
+    if (!user) return;
+    const hasSyncedKey = "kacha_bazar_cat_reorder_restaurant3_confectionery5_v1";
+    if (sessionStorage.getItem(hasSyncedKey)) return;
+
+    const performDryFoodSync = async () => {
+      try {
+        sessionStorage.setItem(hasSyncedKey, "true");
+        // 1. Update/set category documents in Firestore for Restaurant (#3) and Confectionery (#5)
+        await setDoc(doc(db, "categories", "frozen"), {
+          id: "frozen",
+          nameBn: "ড্রাই ফুড",
+          nameEn: "Dry Food",
+          iconName: "Package",
+          colorClass: "bg-amber-50 text-amber-700 hover:bg-amber-100",
+          borderColor: "border-amber-100",
+          displayOrder: 9,
+          order: 9
+        }, { merge: true });
+
+        await setDoc(doc(db, "categories", "bakery-sweets"), {
+          id: "bakery-sweets",
+          nameBn: "রেস্টুরেন্ট",
+          nameEn: "Restaurant",
+          iconName: "Utensils",
+          displayOrder: 3,
+          order: 3
+        }, { merge: true });
+
+        await setDoc(doc(db, "categories", "snacks-biscuits"), {
+          id: "snacks-biscuits",
+          nameBn: "কনফেকশনারি",
+          nameEn: "Confectionery",
+          iconName: "Cookie",
+          displayOrder: 5,
+          order: 5
+        }, { merge: true });
+
+        await setDoc(doc(db, "categories", "fish"), { displayOrder: 4, order: 4 }, { merge: true });
+        await setDoc(doc(db, "categories", "meat"), { displayOrder: 6, order: 6 }, { merge: true });
+        await setDoc(doc(db, "categories", "fruits"), { displayOrder: 7, order: 7 }, { merge: true });
+        await setDoc(doc(db, "categories", "dairy-eggs"), { displayOrder: 8, order: 8 }, { merge: true });
+        await setDoc(doc(db, "categories", "beverages"), { isMerged: true, disabled: true, isAvailable: false }, { merge: true });
+
+        // Ensure "groceries" (মুদি পণ্য) is active and standalone "spices-oils" is merged/deleted
+        await setDoc(doc(db, "categories", "groceries"), {
+          id: "groceries",
+          nameBn: "মুদি পণ্য",
+          nameEn: "Groceries",
+          iconName: "Wheat",
+          displayOrder: 2,
+          order: 2,
+          isAvailable: true,
+          disabled: false
+        }, { merge: true });
+
+        try {
+          await deleteDoc(doc(db, "categories", "spices-oils"));
+        } catch {
+          await setDoc(doc(db, "categories", "spices-oils"), {
+            id: "groceries",
+            isAvailable: false,
+            disabled: true,
+            isMerged: true,
+            isDeleted: true
+          }, { merge: true }).catch(() => {});
+        }
+        try {
+          await deleteDoc(doc(db, "categories", "staples"));
+        } catch {}
+
+        // 2. Remove all old products from former "হিমায়িত খাদ্য" category (fr1 - fr30)
+        for (let i = 1; i <= 30; i++) {
+          const oldRef = doc(db, "products", `fr${i}`);
+          try {
+            await deleteDoc(oldRef);
+          } catch {
+            await setDoc(oldRef, { isDeleted: true, status: "inactive" }, { merge: true }).catch(() => {});
+          }
+        }
+
+        // 3. Write/sync all 39 Dry Food products to Firestore
+        for (const prod of DRY_FOOD_RAW) {
+          const prodRef = doc(db, "products", prod.id);
+          await setDoc(prodRef, {
+            ...prod,
+            isDeleted: false,
+            status: "active",
+            isAvailable: true
+          }, { merge: true });
+        }
+
+        // 4. Sync Grocery products: remove legacy products and upsert all 51 fresh grocery products
+        for (let i = 1; i <= 60; i++) {
+          const stRef = doc(db, "products", `st${i}`);
+          const spRef = doc(db, "products", `sp${i}`);
+          deleteDoc(stRef).catch(() => setDoc(stRef, { isDeleted: true, status: "deleted", isAvailable: false }, { merge: true }).catch(() => {}));
+          deleteDoc(spRef).catch(() => setDoc(spRef, { isDeleted: true, status: "deleted", isAvailable: false }, { merge: true }).catch(() => {}));
+        }
+
+        // 4. Grocery products: Existing products and custom images are permanently preserved in Firestore without destructive overwrite
+
+        // 5. Sync crystal clear product units (kg, gram, piece, liter, ml) across all existing products
+        for (const prod of products) {
+          if (!prod || !prod.id) continue;
+          const resolved = resolveProductUnit(prod);
+          if (resolved.unitBn !== prod.unitBn || resolved.unitEn !== prod.unitEn) {
+            const prodRef = doc(db, "products", prod.id);
+            await setDoc(prodRef, {
+              unitBn: resolved.unitBn,
+              unitEn: resolved.unitEn
+            }, { merge: true }).catch(() => {});
+          }
+        }
+
+        // 6. Sync Pharmacy (ফার্মেসি) Category & remove old baby-care products
+        await setDoc(doc(db, "categories", "pharmacy"), {
+          id: "pharmacy",
+          nameBn: "ফার্মেসি",
+          nameEn: "Pharmacy",
+          iconName: "Pill",
+          colorClass: "bg-teal-50 text-teal-700 hover:bg-teal-100",
+          borderColor: "border-teal-100",
+          displayOrder: 12,
+          order: 12,
+          isAvailable: true
+        }, { merge: true });
+
+        // Update legacy baby-care category doc if exists
+        await setDoc(doc(db, "categories", "baby-care"), {
+          id: "pharmacy",
+          nameBn: "ফার্মেসি",
+          nameEn: "Pharmacy",
+          iconName: "Pill",
+          colorClass: "bg-teal-50 text-teal-700 hover:bg-teal-100",
+          borderColor: "border-teal-100",
+          displayOrder: 12,
+          order: 12,
+          isAvailable: false,
+          isMerged: true
+        }, { merge: true }).catch(() => {});
+
+        // Remove all old products from former "শিশুর যত্ন ও ডায়াপার" category (bc1 - bc30)
+        for (let i = 1; i <= 30; i++) {
+          const oldRef = doc(db, "products", `bc${i}`);
+          try {
+            await deleteDoc(oldRef);
+          } catch {
+            await setDoc(oldRef, { isDeleted: true, status: "inactive" }, { merge: true }).catch(() => {});
+          }
+        }
+
+        // Write/sync all 30 Pharmacy medicine products to Firestore
+        for (const prod of PHARMACY_PRODUCTS_RAW) {
+          const prodRef = doc(db, "products", prod.id);
+          await setDoc(prodRef, {
+            ...prod,
+            isDeleted: false,
+            status: "active",
+            isAvailable: true
+          }, { merge: true });
+        }
+      } catch (e) {
+        console.warn("Dry food, pharmacy and grocery sync notice:", e);
+      }
+    };
+
+    performDryFoodSync();
+  }, [user, products]);
+
+  // Real-time listener for subcategories and initial bootstrap
+  useEffect(() => {
+    bootstrapInitialSubcategoriesIfNeeded();
+    const unsub = subscribeToAllSubcategories((subs) => {
+      setSubcategories(subs);
+    });
+    return () => {
+      if (typeof unsub === "function") unsub();
+    };
+  }, []);
+
+  // Escape key listener to immediately close open modals and restore full interaction
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        if (showProductForm) setShowProductForm(false);
+        if (showCategoryModal) setShowCategoryModal(false);
+        if (showSubcategoryModal) setShowSubcategoryModal(false);
+      }
+    };
+    if (showProductForm || showCategoryModal || showSubcategoryModal) {
+      window.addEventListener("keydown", handleKeyDown);
+    }
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [showProductForm, showCategoryModal, showSubcategoryModal]);
+
+  // Load category information whenever selectedCatId or categories changes
+  useEffect(() => {
+    if (selectedCatId === "spices-oils" || selectedCatId === "staples" || selectedCatId === "spices") {
+      setSelectedCatId("groceries");
+      return;
+    }
+    const currentCat = categories.find(c => c.id === selectedCatId);
+    if (currentCat) {
+      setCatNameBn(currentCat.nameBn || "");
+      setCatNameEn(currentCat.nameEn || "");
+      setCatIcon(currentCat.iconName || "Salad");
+      
+      const savedLocal = lastSavedCategoryImages.current[selectedCatId];
+      const remoteImg = (currentCat.image || currentCat.imageUrl || (currentCat as any).banner || (currentCat as any).bannerUrl || "").trim();
+      // Keep saved image in local state so real-time listeners don't revert to old default values
+      const resolvedImg = savedLocal !== undefined ? savedLocal : remoteImg;
+      setCatImage(resolvedImg);
+
+      setCatColor(currentCat.colorClass || "bg-emerald-50 text-emerald-700");
+      setCatBorder(currentCat.borderColor || "border-emerald-100");
+    } else if (selectedCatId === "vegetables") {
+      setCatNameBn("তাজা শাক-সবজি");
+      setCatNameEn("Fresh Vegetables");
+      setCatIcon("Salad");
+      const savedLocal = lastSavedCategoryImages.current["vegetables"];
+      setCatImage(savedLocal !== undefined ? savedLocal : "");
+      setCatColor("bg-emerald-50 text-emerald-700");
+      setCatBorder("border-emerald-100");
+    }
+  }, [selectedCatId, categories]);
+
+  // Handle image upload for product via universal uploader (Cloudinary upvkzb3p + Storage + Server + Base64)
+  const handleImageFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    setUploadingImage(true);
+    try {
+      const url = await uploadImageWithFallback(file, { folder: "products" });
+      if (url) {
+        setProdImage(url);
+        
+        // Immediately commit the secure_url to Firestore for the product if editing
+        const targetId = editingProduct?.id || prodId;
+        if (targetId) {
+          try {
+            await updateDoc(doc(db, "products", targetId), {
+              imageUrl: url,
+              image: url,
+              updatedAt: serverTimestamp()
+            });
+            console.log(`[Admin] Image URL persisted to Firestore for product ${targetId}:`, url);
+          } catch (writeErr: any) {
+            console.warn("Notice updateDoc failed on image change, attempting setDoc merge:", writeErr?.message);
+            await setDoc(doc(db, "products", targetId), {
+              id: targetId,
+              imageUrl: url,
+              image: url,
+              updatedAt: serverTimestamp()
+            }, { merge: true }).catch((setErr) => {
+              console.error("Firestore setDoc fallback error on image change:", setErr);
+            });
+          }
+
+          if (editingProduct) {
+            setEditingProduct({
+              ...editingProduct,
+              imageUrl: url,
+              image: url
+            });
+          }
+        }
+
+        triggerToast("ছবি সফলভাবে আপলোড ও সেভ হয়েছে!", "Image uploaded and saved successfully!");
+      } else {
+        throw new Error("Could not process image");
+      }
+    } catch (err: any) {
+      console.error("Product image upload failed:", err);
+      triggerToast(err.message || "ছবি আপলোড ব্যর্থ হয়েছে!", "Image upload failed!");
+    } finally {
+      setUploadingImage(false);
+      e.target.value = "";
+    }
+  };
+
+  // Handle image upload for Category via universal uploader
+  const handleCatImageFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    setUploadingCatImage(true);
+    try {
+      const url = await uploadImageWithFallback(file, { folder: "categories" });
+      if (url) {
+        setCatImage(url);
+        if (selectedCatId) {
+          lastSavedCategoryImages.current[selectedCatId] = url;
+        }
+        triggerToast("ক্যাটাগরি ছবি সফলভাবে আপলোড হয়েছে!", "Category image uploaded successfully!");
+      } else {
+        throw new Error("Could not process image");
+      }
+    } catch (err: any) {
+      console.error("Category image upload failed:", err);
+      triggerToast(err.message || "ছবি আপলোড ব্যর্থ হয়েছে!", "Category image upload failed!");
+    } finally {
+      setUploadingCatImage(false);
+      e.target.value = "";
+    }
+  };
+
+  // Save Category Profile & Image Details
+  const handleSaveCategoryDetails = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!selectedCatId || !catNameBn.trim() || !catNameEn.trim()) {
+      triggerToast("সব প্রয়োজনীয় তথ্য পূরণ করুন।", "Please fill all required category fields.");
+      return;
+    }
+
+    setSavingCategory(true);
+    try {
+      const cleanImg = catImage.trim();
+      const catId = selectedCatId.trim().toLowerCase();
+      const payload: any = {
+        id: catId,
+        nameBn: catNameBn.trim(),
+        nameEn: catNameEn.trim(),
+        iconName: catIcon.trim() || "Salad",
+        colorClass: catColor.trim() || "bg-emerald-50 text-emerald-700",
+        borderColor: catBorder.trim() || "border-emerald-100",
+        image: cleanImg,
+        imageUrl: cleanImg,
+        banner: cleanImg,
+        bannerUrl: cleanImg,
+        updatedAt: serverTimestamp()
+      };
+
+      await setDoc(doc(db, "categories", payload.id), payload, { merge: true });
+
+      // Save into cache ref & ensure local input state retains the Cloudinary image URL
+      lastSavedCategoryImages.current[catId] = cleanImg;
+      setCatImage(cleanImg);
+
+      // Optimistically update categories array item so immediate re-render displays new image
+      const matchedCat = categories.find(c => c.id === catId);
+      if (matchedCat) {
+        matchedCat.nameBn = payload.nameBn;
+        matchedCat.nameEn = payload.nameEn;
+        matchedCat.iconName = payload.iconName;
+        matchedCat.image = cleanImg;
+        matchedCat.imageUrl = cleanImg;
+        matchedCat.banner = cleanImg;
+        matchedCat.bannerUrl = cleanImg;
+      }
+
+      triggerToast(
+        `"${catNameBn}" ক্যাটাগরি তথ্য সফলভাবে সেভ হয়েছে!`,
+        `Category "${catNameEn}" profile updated successfully!`
+      );
+    } catch (err) {
+      console.error("Error updating category details:", err);
+      triggerToast("ক্যাটাগরি সেভ করতে সমস্যা হয়েছে", "Failed to update category details");
+    } finally {
+      setSavingCategory(false);
+    }
+  };
+
+  // Helper to render category Lucide icon
+  const renderCategoryIcon = (iconName: string) => {
+    switch (iconName?.toLowerCase()) {
+      case "salad": return <Salad className="w-5 h-5" />;
+      case "fish": return <Fish className="w-5 h-5" />;
+      case "milk": return <Milk className="w-5 h-5" />;
+      case "apple": return <Apple className="w-5 h-5" />;
+      case "flame": return <Flame className="w-5 h-5" />;
+      case "coffee": return <Coffee className="w-5 h-5" />;
+      case "sparkles": return <Sparkles className="w-5 h-5" />;
+      case "package": return <Package className="w-5 h-5" />;
+      case "shoppingbag": return <ShoppingBag className="w-5 h-5" />;
+      case "repeat":
+      case "tag": return <Tag className="w-5 h-5" />;
+      case "pill":
+      case "cross":
+      case "medicine": return <Pill className="w-5 h-5" />;
+      default: return <Salad className="w-5 h-5" />;
+    }
+  };
+
+  // Open Modal to Add Category
+  const handleOpenAddCategory = () => {
+    setEditingCategoryModal(null);
+    setModalCatId("");
+    setModalCatNameBn("");
+    setModalCatNameEn("");
+    setModalCatIcon("Salad");
+    setModalCatImage("");
+    setModalCatColor("bg-emerald-50 text-emerald-700");
+    setModalCatBorder("border-emerald-100");
+    setModalCatIsAvailable(true);
+    setModalCatDisplayOrder(categories.length + 1);
+    setShowCategoryModal(true);
+  };
+
+  // Open Modal to Edit Category
+  const handleOpenEditCategory = (c: any) => {
+    setEditingCategoryModal(c);
+    setModalCatId(c.id);
+    setModalCatNameBn(c.nameBn || "");
+    setModalCatNameEn(c.nameEn || "");
+    setModalCatIcon(c.iconName || "Salad");
+    const existingImg = lastSavedCategoryImages.current[c.id] !== undefined
+      ? lastSavedCategoryImages.current[c.id]
+      : (c.image || c.imageUrl || c.banner || c.bannerUrl || "");
+    setModalCatImage(existingImg);
+    setModalCatColor(c.colorClass || "bg-emerald-50 text-emerald-700");
+    setModalCatBorder(c.borderColor || "border-emerald-100");
+    setModalCatIsAvailable(c.isAvailable !== false && c.disabled !== true);
+    setModalCatDisplayOrder(typeof c.displayOrder === "number" ? c.displayOrder : (typeof c.order === "number" ? c.order : 0));
+    setShowCategoryModal(true);
+  };
+
+  // Modal Category Image Upload via universal uploader
+  const handleModalCatImageFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    setUploadingModalCatImage(true);
+    try {
+      const url = await uploadImageWithFallback(file, { folder: "categories" });
+      if (url) {
+        setModalCatImage(url);
+        triggerToast("ক্যাটাগরি ছবি সফলভাবে আপলোড হয়েছে!", "Category image uploaded successfully!");
+      } else {
+        throw new Error("No secure_url returned");
+      }
+    } catch (err: any) {
+      console.error("Modal category image upload failed:", err);
+      triggerToast(err.message || "ছবি আপলোড ব্যর্থ হয়েছে!", "Category image upload failed!");
+    } finally {
+      setUploadingModalCatImage(false);
+      e.target.value = "";
+    }
+  };
+
+  // Save Modal Category
+  const handleSaveCategoryModal = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!modalCatNameBn.trim() || !modalCatNameEn.trim()) {
+      triggerToast("বাংলা ও ইংরেজি নাম প্রয়োজন", "Bangla & English names are required");
+      return;
+    }
+
+    const finalId = editingCategoryModal 
+      ? editingCategoryModal.id 
+      : (modalCatId.trim().toLowerCase().replace(/[^a-z0-9_-]/g, "_") || modalCatNameEn.trim().toLowerCase().replace(/[^a-z0-9_-]/g, "_"));
+
+    if (!finalId) {
+      triggerToast("ক্যাটাগরি আইডি প্রদান করুন", "Category ID is required");
+      return;
+    }
+
+    setSavingCategoryModal(true);
+    try {
+      const cleanImg = modalCatImage.trim();
+      const payload: any = {
+        id: finalId,
+        nameBn: modalCatNameBn.trim(),
+        nameEn: modalCatNameEn.trim(),
+        iconName: modalCatIcon.trim() || "Salad",
+        colorClass: modalCatColor.trim() || "bg-emerald-50 text-emerald-700",
+        borderColor: modalCatBorder.trim() || "border-emerald-100",
+        image: cleanImg,
+        imageUrl: cleanImg,
+        banner: cleanImg,
+        bannerUrl: cleanImg,
+        isAvailable: modalCatIsAvailable,
+        disabled: !modalCatIsAvailable,
+        displayOrder: Number(modalCatDisplayOrder) || 0,
+        order: Number(modalCatDisplayOrder) || 0,
+        updatedAt: serverTimestamp(),
+        ...(editingCategoryModal ? {} : { createdAt: serverTimestamp() })
+      };
+
+      await setDoc(doc(db, "categories", finalId), payload, { merge: true });
+
+      // Save into cache ref & ensure local state keeps the updated image
+      lastSavedCategoryImages.current[finalId] = cleanImg;
+      if (selectedCatId === finalId) {
+        setCatImage(cleanImg);
+      }
+      setSelectedCatId(finalId);
+
+      // Optimistically update in-memory category item
+      const matchedCat = categories.find(c => c.id === finalId);
+      if (matchedCat) {
+        matchedCat.nameBn = payload.nameBn;
+        matchedCat.nameEn = payload.nameEn;
+        matchedCat.iconName = payload.iconName;
+        matchedCat.image = cleanImg;
+        matchedCat.imageUrl = cleanImg;
+        matchedCat.banner = cleanImg;
+        matchedCat.bannerUrl = cleanImg;
+      }
+
+      triggerToast(
+        `"${modalCatNameBn}" ক্যাটাগরি সফলভাবে সেভ করা হয়েছে!`,
+        `Category "${modalCatNameEn}" saved successfully!`
+      );
+      setShowCategoryModal(false);
+    } catch (err) {
+      console.error("Error saving category modal:", err);
+      triggerToast("ক্যাটাগরি সেভ করতে ব্যর্থ হয়েছে", "Failed to save category");
+    } finally {
+      setSavingCategoryModal(false);
+    }
+  };
+
+  // Enable / Disable Category
+  const handleToggleCategoryAvailability = async (catId: string, currentStatus: boolean) => {
+    try {
+      const newStatus = !currentStatus;
+      await setDoc(doc(db, "categories", catId), {
+        isAvailable: newStatus,
+        disabled: !newStatus,
+        updatedAt: serverTimestamp()
+      }, { merge: true });
+
+      triggerToast(
+        newStatus ? "ক্যাটাগরি সক্রিয় করা হয়েছে" : "ক্যাটাগরি নিষ্ক্রিয় করা হয়েছে",
+        newStatus ? "Category enabled" : "Category disabled"
+      );
+    } catch (err) {
+      console.error("Error toggling category availability:", err);
+      triggerToast("স্ট্যাটাস আপডেট ব্যর্থ হয়েছে", "Failed to update category status");
+    }
+  };
+
+  // Reorder Category Position
+  const handleReorderCategory = async (catId: string, direction: "up" | "down", sortedCats: any[]) => {
+    const index = sortedCats.findIndex(c => c.id === catId);
+    if (index === -1) return;
+    const targetIndex = direction === "up" ? index - 1 : index + 1;
+    if (targetIndex < 0 || targetIndex >= sortedCats.length) return;
+
+    const currentCat = sortedCats[index];
+    const targetCat = sortedCats[targetIndex];
+
+    const currentOrder = typeof currentCat.displayOrder === "number" ? currentCat.displayOrder : (typeof currentCat.order === "number" ? currentCat.order : index);
+    const targetOrder = typeof targetCat.displayOrder === "number" ? targetCat.displayOrder : (typeof targetCat.order === "number" ? targetCat.order : targetIndex);
+
+    let newCurrentOrder = targetOrder;
+    let newTargetOrder = currentOrder;
+
+    if (newCurrentOrder === newTargetOrder) {
+      newCurrentOrder = direction === "up" ? targetIndex : targetIndex;
+      newTargetOrder = index;
+    }
+
+    try {
+      await Promise.all([
+        setDoc(doc(db, "categories", currentCat.id), { displayOrder: newCurrentOrder, order: newCurrentOrder }, { merge: true }),
+        setDoc(doc(db, "categories", targetCat.id), { displayOrder: newTargetOrder, order: newTargetOrder }, { merge: true })
+      ]);
+      triggerToast("ক্যাটাগরি সিকোয়েন্স আপডেট করা হয়েছে", "Category order updated successfully");
+    } catch (err) {
+      console.error("Error reordering category:", err);
+      triggerToast("রিঅর্ডার করতে সমস্যা হয়েছে", "Failed to reorder category");
+    }
+  };
+
+  // Open product form for editing
+  const handleOpenEditProduct = (p: any) => {
+    setEditingProduct(p);
+    setProdId(p.id);
+    setProdNameEn(p.nameEn || "");
+    setProdNameBn(p.nameBn || "");
+    setProdPrice(p.price || 0);
+    setProdOrigPrice(p.originalPrice || p.price || 0);
+    setProdUnitEn(p.unitEn || "");
+    setProdUnitBn(p.unitBn || "");
+    const isRest = isCategoryMatch(p.category, "restaurant") || isCategoryMatch(p.categoryId, "restaurant") ||
+      p.category === "bakery-sweets" || p.category === "restaurant" || p.category === "রেস্টুরেন্ট" ||
+      p.categoryId === "bakery-sweets" || p.categoryId === "restaurant" || p.categoryId === "রেস্টুরেন্ট";
+
+    const effectiveCat = isRest
+      ? "bakery-sweets"
+      : (p.categoryId || (isCategoryMatch(p.category, "groceries")
+        ? "groceries"
+        : (isCategoryMatch(p.category, "snacks-biscuits") 
+          ? "snacks-biscuits" 
+          : (isCategoryMatch(p.category, "frozen") ? "frozen" : (p.category || selectedCatId || "vegetables")))));
+    setProdCategory(effectiveCat);
+    
+    // Resolve subcategoryId if explicitly saved or match by subcategory name
+    let matchedSubId = p.subcategoryId || (p as any).subCategoryId || "";
+    const rawSubName = (p.subcategory || (p as any).subCategory || "").trim();
+    if (!matchedSubId && rawSubName) {
+      const match = subcategories.find(s => 
+        (s.categoryId === effectiveCat || (isRest && (s.categoryId === "bakery-sweets" || s.categoryId === "restaurant"))) &&
+        (s.nameBn === rawSubName || s.nameEn === rawSubName || s.id === rawSubName)
+      );
+      if (match) {
+        matchedSubId = match.id;
+      } else if (isRest) {
+        const stdMatch = RESTAURANT_SUBCATEGORIES.find(
+          s => s.nameBn.toLowerCase() === rawSubName.toLowerCase() ||
+               s.nameEn.toLowerCase() === rawSubName.toLowerCase() ||
+               s.id.toLowerCase() === rawSubName.toLowerCase()
+        );
+        if (stdMatch) matchedSubId = stdMatch.id;
+      }
+    } else if (!matchedSubId && isRest) {
+      const resolved = getResolvedRestaurantSubcategory(p);
+      const stdMatch = RESTAURANT_SUBCATEGORIES.find(s => s.nameBn === resolved);
+      if (stdMatch) matchedSubId = stdMatch.id;
+    }
+    setProdSubcategoryId(matchedSubId);
+    setProdSubcategory(rawSubName || (isRest ? getResolvedRestaurantSubcategory(p) : ""));
+    setProdStock(p.stock || 0);
+    setProdImage(p.image || p.imageUrl || "");
+    setProdDescEn(p.descriptionEn || "");
+    setProdDescBn(p.descriptionBn || "");
+    setProdBrand(p.brand || "");
+    setProdSku(p.sku || "");
+    setProdOptions(p.options || []);
+    setProdIsAvailable(p.isAvailable !== false);
+    setProdDisplayOrder(typeof p.displayOrder === "number" ? p.displayOrder : 0);
+    setNewOptValue("");
+    setNewOptPrice("");
+    setNewOptStock("");
+    setShowProductForm(true);
+  };
+
+  // Open form for fresh product creation
+  const handleOpenCreateProduct = (defaultCategory?: string) => {
+    setEditingProduct(null);
+    const targetCat = defaultCategory || selectedCatId || "vegetables";
+    const nextId = "prod_" + Date.now().toString(36);
+    setProdId(nextId);
+    setProdNameEn("");
+    setProdNameBn("");
+    setProdPrice(0);
+    setProdOrigPrice(0);
+    setProdUnitEn("1 kg");
+    setProdUnitBn("১ কেজি");
+    const isRest = isCategoryMatch(targetCat, "restaurant") || targetCat === "bakery-sweets" || targetCat === "restaurant" || targetCat === "রেস্টুরেন্ট";
+    const isDryFood = isCategoryMatch(targetCat, "frozen") || targetCat === "frozen" || targetCat === "dry-food" || targetCat === "dryfood" || targetCat === "ড্রাই ফুড";
+    const effectiveCat = isRest ? "bakery-sweets" : (isDryFood ? "frozen" : targetCat);
+    setProdCategory(effectiveCat);
+    const matchingSubs = isRest
+      ? RESTAURANT_SUBCATEGORIES.map(s => ({ id: s.id, categoryId: "bakery-sweets", nameBn: s.nameBn, nameEn: s.nameEn, order: s.order }))
+      : subcategories.filter(s => (s.categoryId === effectiveCat || (isDryFood && (s.categoryId === "frozen" || s.categoryId === "dry-food"))) && !s.isDeleted);
+    setProdSubcategoryId(matchingSubs.length > 0 ? matchingSubs[0].id : "");
+    setProdSubcategory(matchingSubs.length > 0 ? matchingSubs[0].nameBn : (isDryFood ? "ড্রাই ফুড" : ""));
+    setProdStock(50);
+    setProdImage("");
+    setProdDescEn("");
+    setProdDescBn("");
+    setProdBrand("Kacha Bazar");
+    setProdSku("KB-" + targetCat.substring(0, 3).toUpperCase() + "-" + Math.floor(100 + Math.random() * 900));
+    setProdOptions([]);
+    setProdIsAvailable(true);
+    setProdDisplayOrder(0);
+    setNewOptValue("");
+    setNewOptPrice("");
+    setNewOptStock("");
+    setShowProductForm(true);
+  };
+
+  // Save product (Insert / Update) - Stores categoryId and subcategoryId in Firestore
+  const handleSaveProduct = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!prodNameEn.trim() || !prodNameBn.trim() || !prodCategory) {
+      triggerToast("প্রয়োজনীয় ঘরগুলো পূরণ করুন!", "Please fill in all required fields!");
+      return;
+    }
+
+    setSavingProduct(true);
+    try {
+      const resolvedImg = prodImage.trim() || "https://images.unsplash.com/photo-1542838132-92c53300491e?auto=format&fit=crop&w=400&q=80";
+      const isRestItem = isCategoryMatch(prodCategory, "restaurant") || prodCategory === "bakery-sweets" || prodCategory === "restaurant" || prodCategory === "রেস্টুরেন্ট";
+      const isGroceryItem = isCategoryMatch(prodCategory, "groceries") || prodCategory === "groceries" || prodCategory === "মুদি পণ্য";
+      const isDryFoodItem = isCategoryMatch(prodCategory, "frozen") || prodCategory === "frozen" || prodCategory === "dry-food" || prodCategory === "dryfood" || prodCategory === "ড্রাই ফুড";
+      const isConfectioneryItem = isCategoryMatch(prodCategory, "snacks-biscuits") || prodCategory === "snacks-biscuits" || prodCategory === "confectionery" || prodCategory === "কনফেকশনারি";
+
+      const selectedSub = subcategories.find(s => s.id === prodSubcategoryId) ||
+                          (isRestItem ? RESTAURANT_SUBCATEGORIES.find(s => s.id === prodSubcategoryId) : null);
+      const resolvedSubName = selectedSub ? selectedSub.nameBn : (prodSubcategory.trim() || (isRestItem ? "বিরিয়ানি, পোলাও ও রাইস" : (isDryFoodItem ? "ড্রাই ফুড" : (isConfectioneryItem ? "চকলেট ও ক্যান্ডি" : "General"))));
+      const resolvedSubId = prodSubcategoryId || (selectedSub ? selectedSub.id : "");
+
+      const finalId = editingProduct ? (editingProduct.id || prodId) : (prodId || `prod_${Date.now().toString(36)}_${Math.random().toString(36).substring(2, 6)}`);
+
+      const resolvedCategoryId = isGroceryItem 
+        ? "groceries" 
+        : (isRestItem 
+            ? "bakery-sweets" 
+            : (isDryFoodItem ? "frozen" : (isConfectioneryItem ? "snacks-biscuits" : (normalizeCategoryId(prodCategory) || prodCategory))));
+
+      const resolvedCategoryName = isGroceryItem 
+        ? "মুদি পণ্য" 
+        : (isRestItem 
+            ? "রেস্টুরেন্ট" 
+            : (isDryFoodItem ? "ড্রাই ফুড" : (isConfectioneryItem ? "কনফেকশনারি" : (prodCategory === "groceries" ? "মুদি পণ্য" : prodCategory))));
+
+      const payload: any = {
+        id: finalId,
+        name: prodNameBn.trim(),
+        nameEn: prodNameEn.trim(),
+        nameBn: prodNameBn.trim(),
+        price: Number(prodPrice) || 0,
+        originalPrice: Number(prodOrigPrice) || Number(prodPrice) || 0,
+        unit: prodUnitBn.trim() || "১ পিছ",
+        unitEn: prodUnitEn.trim() || "1 pc",
+        unitBn: prodUnitBn.trim() || "১ পিছ",
+        categoryId: resolvedCategoryId,
+        subcategoryId: resolvedSubId,
+        subCategoryId: resolvedSubId,
+        category: resolvedCategoryName,
+        categoryBn: resolvedCategoryName,
+        categoryEn: isDryFoodItem ? "Dry Food" : (isRestItem ? "Restaurant" : (isGroceryItem ? "Groceries" : (isConfectioneryItem ? "Confectionery" : prodNameEn))),
+        subcategory: resolvedSubName,
+        subCategory: resolvedSubName,
+        stock: Number(prodStock) || 0,
+        image: resolvedImg,
+        imageUrl: resolvedImg,
+        description: prodDescBn.trim() || prodDescEn.trim() || "",
+        descriptionEn: prodDescEn.trim(),
+        descriptionBn: prodDescBn.trim(),
+        brand: prodBrand.trim() || (isRestItem ? "Kacha Bazar Restaurant" : "Kacha Bazar"),
+        sku: prodSku.trim() || `KB-${(isGroceryItem ? "GRO" : (isRestItem ? "REST" : (isDryFoodItem ? "DRY" : prodCategory))).substring(0, 3).toUpperCase()}-${finalId}`,
+        options: prodOptions,
+        isAvailable: prodIsAvailable !== false,
+        inStock: (Number(prodStock) || 0) > 0,
+        displayOrder: Number(prodDisplayOrder) || 0,
+        order: Number(prodDisplayOrder) || 0,
+        isDeleted: false,
+        deleted: false,
+        status: "active",
+        updatedAt: serverTimestamp()
+      };
+
+      if (!editingProduct) {
+        payload.createdAt = serverTimestamp();
+        let saveSuccess = false;
+
+        // Primary: Direct Firestore setDoc with explicit ID and merge
+        try {
+          await setDoc(doc(db, "products", finalId), payload, { merge: true });
+          console.log("[Admin] Successfully saved product directly to Firestore:", finalId);
+          saveSuccess = true;
+        } catch (setErr: any) {
+          console.warn("[Admin] Direct Firestore write notice, attempting server fallback:", setErr?.message || setErr);
+          // Fallback 1: Server endpoint using Admin SDK
+          try {
+            const res = await apiClient.post("/api/products/upsert", {
+              ...payload,
+              createdAt: new Date().toISOString(),
+              updatedAt: new Date().toISOString()
+            });
+            if (res?.success) {
+              console.log("[Admin] Successfully saved product via server Admin API:", finalId);
+              saveSuccess = true;
+            }
+          } catch (apiErr: any) {
+            console.warn("[Admin] Server upsert error, attempting addDoc fallback:", apiErr?.message || apiErr);
+            // Fallback 2: addDoc fallback
+            try {
+              const docRef = await addDoc(collection(db, "products"), { ...payload });
+              await updateDoc(docRef, { id: docRef.id }).catch(() => {});
+              payload.id = docRef.id;
+              saveSuccess = true;
+            } catch (addErr: any) {
+              console.error("[Admin] All product save methods failed:", addErr);
+              triggerToast(`পণ্য সেভ করা যায়নি: ${setErr?.message || addErr?.message || "ত্রুটি"}`, `Failed to save product: ${setErr?.message || addErr?.message || "Error"}`);
+              throw setErr || addErr;
+            }
+          }
+        }
+
+        if (saveSuccess) {
+          // Immediately update optimistic state in Admin and App
+          onProductSaved?.({ ...payload, id: payload.id || finalId });
+          triggerToast(
+            isGroceryItem ? "নতুন মুদি পণ্য সফলভাবে যুক্ত করা হয়েছে!" : (isDryFoodItem ? "নতুন ড্রাই ফুড পণ্য সফলভাবে যুক্ত করা হয়েছে!" : "নতুন পণ্য যুক্ত করা হয়েছে!"),
+            isGroceryItem ? "New grocery product added successfully!" : (isDryFoodItem ? "New dry food product added successfully!" : "New product added to catalog successfully!")
+          );
+          setShowProductForm(false);
+        }
+      } else {
+        const updatePayload = {
+          ...payload,
+          id: finalId,
+          categoryId: resolvedCategoryId,
+          category: resolvedCategoryName,
+          categoryBn: resolvedCategoryName,
+          categoryEn: isDryFoodItem ? "Dry Food" : (isRestItem ? "Restaurant" : (isGroceryItem ? "Groceries" : prodNameEn)),
+          subcategoryId: resolvedSubId,
+          subCategoryId: resolvedSubId,
+          subcategory: resolvedSubName,
+          subCategory: resolvedSubName,
+          imageUrl: resolvedImg,
+          image: resolvedImg,
+          description: prodDescBn.trim() || prodDescEn.trim() || "",
+          descriptionEn: prodDescEn.trim(),
+          descriptionBn: prodDescBn.trim(),
+          isDeleted: false,
+          deleted: false,
+          status: "active",
+          updatedAt: serverTimestamp()
+        };
+
+        let updateSuccess = false;
+        try {
+          await setDoc(doc(db, "products", finalId), updatePayload, { merge: true });
+          console.log("[Admin] Successfully updated product directly:", finalId);
+          updateSuccess = true;
+        } catch (setErr: any) {
+          console.warn("[Admin] Direct update notice, trying updateDoc:", setErr?.message || setErr);
+          try {
+            await updateDoc(doc(db, "products", finalId), updatePayload);
+            updateSuccess = true;
+          } catch (upErr: any) {
+            console.warn("[Admin] updateDoc notice, trying server fallback:", upErr?.message || upErr);
+            try {
+              const res = await apiClient.post("/api/products/upsert", {
+                ...updatePayload,
+                updatedAt: new Date().toISOString()
+              });
+              if (res?.success) {
+                updateSuccess = true;
+              }
+            } catch (apiErr: any) {
+              console.error("[Admin] Product update failed across all tiers:", apiErr);
+              triggerToast(`পণ্য আপডেট করা যায়নি: ${setErr?.message || "ত্রুটি"}`, "Failed to update product");
+              throw setErr;
+            }
+          }
+        }
+
+        if (updateSuccess) {
+          onProductSaved?.(updatePayload);
+          triggerToast("পণ্য সফলভাবে আপডেট করা হয়েছে!", "Product details updated successfully!");
+          setShowProductForm(false);
+        }
+      }
+    } catch (err: any) {
+      console.error("Error saving product:", err);
+    } finally {
+      setSavingProduct(false);
+    }
+  };
+
+  // Subcategory Order and CRUD Handlers
+  const handleUpdateSubcategoryOrder = async (subId: string, newOrder: number) => {
+    try {
+      await updateSubcategoryOrder(subId, newOrder);
+      triggerToast("সাবক্যাটাগরি ক্রম সফলভাবে আপডেট হয়েছে!", "Subcategory order updated!");
+    } catch (err: any) {
+      console.error("Error updating subcategory order:", err);
+      triggerToast("ক্রম আপডেট করতে সমস্যা হয়েছে!", "Failed to update subcategory order!");
+    }
+  };
+
+  const handleMoveSubcategory = async (sub: Subcategory, direction: "up" | "down") => {
+    const list = subcategories
+      .filter(s => s.categoryId === sub.categoryId)
+      .sort((a, b) => (a.order || 0) - (b.order || 0));
+
+    const idx = list.findIndex(s => s.id === sub.id);
+    if (idx === -1) return;
+
+    const targetIdx = direction === "up" ? idx - 1 : idx + 1;
+    if (targetIdx < 0 || targetIdx >= list.length) return;
+
+    const targetSub = list[targetIdx];
+    const order1 = sub.order || (idx + 1);
+    const order2 = targetSub.order || (targetIdx + 1);
+
+    try {
+      await updateSubcategoryOrder(sub.id, order2);
+      await updateSubcategoryOrder(targetSub.id, order1);
+      triggerToast("ক্রম সফলভাবে পরিবর্তিত হয়েছে!", "Order swapped successfully!");
+    } catch (err) {
+      console.error("Failed to move subcategory:", err);
+      triggerToast("ক্রম পরিবর্তন করা যায়নি!", "Failed to reorder!");
+    }
+  };
+
+  const handleOpenAddSubcategory = (defaultCat?: string) => {
+    setEditingSubcategory(null);
+    const cat = defaultCat || (selectedSubcatCategoryFilter !== "all" ? selectedSubcatCategoryFilter : "groceries");
+    const existing = subcategories.filter(s => s.categoryId === cat);
+    setSubModalCategoryId(cat);
+    setSubModalNameBn("");
+    setSubModalNameEn("");
+    setSubModalOrder(existing.length + 1);
+    setShowSubcategoryModal(true);
+  };
+
+  const handleOpenEditSubcategory = (sub: Subcategory) => {
+    setEditingSubcategory(sub);
+    setSubModalCategoryId(sub.categoryId);
+    setSubModalNameBn(sub.nameBn);
+    setSubModalNameEn(sub.nameEn || sub.nameBn);
+    setSubModalOrder(sub.order || 1);
+    setShowSubcategoryModal(true);
+  };
+
+  const handleSaveSubcategory = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!subModalNameBn.trim() || !subModalCategoryId) {
+      triggerToast("সাবক্যাটাগরির নাম ও ক্যাটাগরি আবশ্যক!", "Name and Category are required!");
+      return;
+    }
+    setSavingSubModal(true);
+    try {
+      await saveSubcategory({
+        id: editingSubcategory?.id,
+        categoryId: subModalCategoryId,
+        nameBn: subModalNameBn.trim(),
+        nameEn: subModalNameEn.trim() || subModalNameBn.trim(),
+        order: Number(subModalOrder) || 1
+      });
+      triggerToast(
+        editingSubcategory ? "সাবক্যাটাগরি আপডেট করা হয়েছে!" : "নতুন সাবক্যাটাগরি তৈরি হয়েছে!",
+        editingSubcategory ? "Subcategory updated!" : "Subcategory created!"
+      );
+      setShowSubcategoryModal(false);
+    } catch (err) {
+      console.error("Error saving subcategory:", err);
+      triggerToast("সংরক্ষণ করা যায়নি!", "Failed to save subcategory!");
+    } finally {
+      setSavingSubModal(false);
+    }
+  };
+
+  const handleDeleteSubcategory = async (sub: Subcategory) => {
+    if (!confirm(getTranslation(`"${sub.nameBn}" সাবক্যাটাগরি কি মুছে ফেলতে চান?`, `Delete subcategory "${sub.nameEn || sub.nameBn}"?`))) return;
+    try {
+      await softDeleteSubcategory(sub.id);
+      triggerToast("সাবক্যাটাগরি মুছে ফেলা হয়েছে!", "Subcategory deleted!");
+    } catch (err) {
+      console.error("Error deleting subcategory:", err);
+      triggerToast("ডিলিট করতে সমস্যা হয়েছে!", "Failed to delete subcategory!");
+    }
+  };
+
+  // Helper to remove any undefined fields before sending to Firestore
+  const sanitizeForFirestore = (obj: any) => {
+    if (!obj || typeof obj !== "object") return {};
+    const clean: Record<string, any> = {};
+    for (const [key, val] of Object.entries(obj)) {
+      if (val !== undefined) {
+        clean[key] = val;
+      }
+    }
+    return clean;
+  };
+
+  // Quick enable/disable toggle
+  const handleToggleProductAvailability = async (productId: string, currentStatus: boolean) => {
+    try {
+      const nextStatus = !currentStatus;
+      const targetProd = products.find(p => p.id === productId) || ALL_PRODUCTS.find(p => p.id === productId);
+
+      const payload = targetProd
+        ? {
+            ...sanitizeForFirestore(targetProd),
+            id: productId,
+            isAvailable: nextStatus,
+            updatedAt: new Date()
+          }
+        : {
+            id: productId,
+            isAvailable: nextStatus,
+            updatedAt: new Date()
+          };
+
+      await setDoc(doc(db, "products", productId), payload, { merge: true });
+
+      triggerToast(
+        nextStatus ? "পণ্যটি এখন ক্যাটালগে সক্রিয়!" : "পণ্যটি ক্যাটালগে লুকানো/নিষ্ক্রিয় করা হয়েছে!",
+        nextStatus ? "Product enabled and visible to shoppers!" : "Product disabled/hidden from catalog!"
+      );
+    } catch (err) {
+      console.error("Error toggling product status:", err);
+      triggerToast("স্ট্যাটাস পরিবর্তন ব্যর্থ হয়েছে", "Failed to update status");
+    }
+  };
+
+  // Product reordering helper (move up / move down)
+  const handleReorderProduct = async (prodId: string, direction: "up" | "down", catProducts: any[]) => {
+    const currentIndex = catProducts.findIndex(p => p.id === prodId);
+    if (currentIndex === -1) return;
+    const targetIndex = direction === "up" ? currentIndex - 1 : currentIndex + 1;
+    if (targetIndex < 0 || targetIndex >= catProducts.length) return;
+
+    const currentItem = catProducts[currentIndex];
+    const targetItem = catProducts[targetIndex];
+
+    const currentOrder = typeof currentItem.displayOrder === "number" ? currentItem.displayOrder : currentIndex;
+    const targetOrder = typeof targetItem.displayOrder === "number" ? targetItem.displayOrder : targetIndex;
+
+    const newCurrentOrder = targetOrder;
+    const newTargetOrder = currentOrder === targetOrder ? (direction === "up" ? targetOrder + 1 : Math.max(0, targetOrder - 1)) : currentOrder;
+
+    try {
+      const currentPayload = {
+        ...sanitizeForFirestore(currentItem),
+        id: currentItem.id,
+        displayOrder: newCurrentOrder,
+        order: newCurrentOrder,
+        updatedAt: new Date()
+      };
+      const targetPayload = {
+        ...sanitizeForFirestore(targetItem),
+        id: targetItem.id,
+        displayOrder: newTargetOrder,
+        order: newTargetOrder,
+        updatedAt: new Date()
+      };
+
+      await setDoc(doc(db, "products", currentItem.id), currentPayload, { merge: true });
+      await setDoc(doc(db, "products", targetItem.id), targetPayload, { merge: true });
+      triggerToast("পণ্যের পজিশন পরিবর্তন করা হয়েছে!", "Product reordered successfully!");
+    } catch (err) {
+      console.error("Error reordering product:", err);
+      triggerToast("রিঅর্ডার সেভ করা যায়নি", "Failed to reorder product");
+    }
+  };
+
+  // Delete product: Opens confirmation popup modal with order-usage analysis
+  const handleDeleteProduct = (productIdOrProd: string | any) => {
+    if (typeof productIdOrProd === "string") {
+      const found = products.find(p => p.id === productIdOrProd);
+      if (found) {
+        setProductPendingDelete(found);
+      } else {
+        setProductPendingDelete({ id: productIdOrProd, nameBn: "পণ্য", nameEn: "Product" });
+      }
+    } else if (productIdOrProd && typeof productIdOrProd === "object") {
+      setProductPendingDelete(productIdOrProd);
+    }
+  };
+
+  // Add weight/pricing option
+  const handleAddOption = () => {
+    if (!newOptValue || !newOptPrice) return;
+    const option: ProductOption = {
+      id: "opt_" + Date.now(),
+      value: Number(newOptValue),
+      unit: newOptUnit,
+      price: Number(newOptPrice),
+      stock: newOptStock ? Number(newOptStock) : prodStock
+    };
+    setProdOptions([...prodOptions, option]);
+    setNewOptValue("");
+    setNewOptPrice("");
+    setNewOptStock("");
+  };
+
+  // Delete option
+  const handleRemoveOption = (id: string) => {
+    setProdOptions(prodOptions.filter(o => o.id !== id));
+  };
+
+  // Delete Category with safe product check & confirmation
+  const handleDeleteCategory = async (id: string) => {
+    if (!id) return;
+    const targetCat = categories.find(c => c.id === id);
+    const catName = targetCat ? (lang === "bn" ? targetCat.nameBn : targetCat.nameEn) : id;
+    
+    // Count products belonging to this category
+    const relatedProducts = products
+      .filter(p => !isProductDeleted(p))
+      .filter(p => shouldKeepProductGroceryFiltered(p))
+      .filter(p => isCategoryMatch(p.category || p.categoryId, id));
+    const prodCount = relatedProducts.length;
+
+    let confirmMsg = "";
+    if (prodCount > 0) {
+      confirmMsg = getTranslation(
+        `সতর্কতা: "${catName}" ক্যাটাগরিতে ${prodCount} টি পণ্য রয়েছে!\n\nক্যাটাগরি ডিলিট করলে উক্ত পণ্যগুলো ডাটাবেজে নিরাপদ ও অক্ষত থাকবে কিন্তু ক্যাটাগরি তালিকা থেকে ক্যাটাগরি সরে যাবে।\n\nআপনি কি নিশ্চিতভাবে "${catName}" ক্যাটাগরি ডিলিট করতে চান?`,
+        `Warning: "${catName}" category currently contains ${prodCount} products!\n\nDeleting this category will keep all products safely intact in your database.\n\nAre you sure you want to delete the category "${catName}"?`
+      );
+    } else {
+      confirmMsg = getTranslation(
+        `আপনি কি নিশ্চিতভাবে "${catName}" ক্যাটাগরি ডিলিট করতে চান?`,
+        `Are you sure you want to delete the category "${catName}"?`
+      );
+    }
+
+    if (!confirm(confirmMsg)) return;
+
+    try {
+      await deleteDoc(doc(db, "categories", id));
+      triggerToast(
+        `"${catName}" ক্যাটাগরি সফলভাবে ডিলিট করা হয়েছে!`,
+        `Category "${catName}" successfully deleted!`
+      );
+      
+      const remaining = categories.filter(c => c.id !== id);
+      if (selectedCatId === id) {
+        if (remaining.length > 0) {
+          setSelectedCatId(remaining[0].id);
+        } else {
+          setSelectedCatId("vegetables");
+        }
+      }
+    } catch (err) {
+      console.error("Error deleting category:", err);
+      triggerToast("ক্যাটাগরি ডিলিট ব্যর্থ হয়েছে", "Failed to delete category");
+    }
+  };
+
+  // Bulk CSV Export
+  const handleExportCSV = () => {
+    const headers = ["id", "nameEn", "nameBn", "price", "originalPrice", "unitEn", "unitBn", "category", "stock", "image", "descriptionEn", "descriptionBn", "isAvailable", "displayOrder"];
+    const rows = products
+      .filter(p => !isProductDeleted(p))
+      .map(p => [
+      p.id,
+      `"${p.nameEn?.replace(/"/g, '""') || ''}"`,
+      `"${p.nameBn?.replace(/"/g, '""') || ''}"`,
+      p.price,
+      p.originalPrice || "",
+      p.unitEn || "1 kg",
+      p.unitBn || "১ কেজি",
+      p.category,
+      p.stock,
+      p.image,
+      `"${p.descriptionEn?.replace(/"/g, '""') || ''}"`,
+      `"${p.descriptionBn?.replace(/"/g, '""') || ''}"`,
+      p.isAvailable !== false ? "true" : "false",
+      p.displayOrder || 0
+    ]);
+
+    const csvContent = [headers.join(","), ...rows.map(r => r.join(","))].join("\n");
+    const blob = new Blob([csvContent], { type: "text/csv;charset=utf-8;" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.setAttribute("href", url);
+    link.setAttribute("download", "kachabazar_products_export.csv");
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    triggerToast("সব ডাটা সফলভাবে ডাউনলোড করা হয়েছে!", "All products exported to CSV successfully!");
+  };
+
+  // Bulk CSV Import
+  const handleImportCSV = async () => {
+    if (!bulkCsvText.trim()) {
+      triggerToast("পাস করা সিএসভি টেক্সট খালি!", "CSV payload text is empty!");
+      return;
+    }
+
+    setImportingBulk(true);
+    try {
+      const lines = bulkCsvText.split("\n").map(l => l.trim()).filter(Boolean);
+      if (lines.length < 2) {
+        triggerToast("কমপক্ষে হেডার ও এক লাইন ডাটা আবশ্যক!", "Insufficient CSV lines parsed!");
+        setImportingBulk(false);
+        return;
+      }
+
+      const headers = lines[0].split(",").map(h => h.trim());
+      let successCount = 0;
+
+      for (let i = 1; i < lines.length; i++) {
+        const parts = lines[i].split(",").map(p => p.trim());
+        if (parts.length < headers.length) continue;
+
+        const row: any = {};
+        headers.forEach((h, idx) => {
+          row[h] = parts[idx];
+        });
+
+        const newId = "prod_bulk_" + Math.random().toString(36).substr(2, 9);
+        const payload = {
+          id: newId,
+          nameEn: row.nameEn || "Bulk Product",
+          nameBn: row.nameBn || "বাল্ক প্রোডাক্ট",
+          price: Number(row.price) || 0,
+          originalPrice: Number(row.price) || 0,
+          stock: Number(row.stock) || 10,
+          category: row.category || selectedCatId || "vegetables",
+          unitEn: row.unitEn || "1 kg",
+          unitBn: row.unitBn || "১ কেজি",
+          image: row.image || "https://images.unsplash.com/photo-1542838132-92c53300491e?auto=format&fit=crop&w=400&q=80",
+          descriptionEn: row.descriptionEn || "Bulk imported item",
+          descriptionBn: row.descriptionBn || "বাল্ক আমদানিকৃত পণ্য",
+          isAvailable: true,
+          displayOrder: 0,
+          rating: 4.5,
+          reviewCount: 0
+        };
+
+        await setDoc(doc(db, "products", newId), payload);
+        successCount++;
+      }
+
+      triggerToast(`${successCount} টি পণ্য বাল্ক ইম্পোর্ট করা হয়েছে!`, `Successfully imported ${successCount} items from CSV!`);
+      setBulkCsvText("");
+      setActiveCatalogSubTab("category_manager");
+    } catch (err) {
+      console.error("Bulk import failed:", err);
+      triggerToast("ইম্পোর্ট করতে সমস্যা হয়েছে!", "Error encountered during CSV batch processing.");
+    } finally {
+      setImportingBulk(false);
+    }
+  };
+
+  // Products belonging to currently selected category (e.g. "vegetables")
+  const categoryProducts = products
+    .filter(p => !isProductDeleted(p))
+    .filter(p => shouldKeepProductGroceryFiltered(p))
+    .filter(p => isCategoryMatch(p.category || p.categoryId, selectedCatId));
+
+  // Filtered products for Category Manager view
+  const filteredCategoryProducts = categoryProducts
+    .filter(p => {
+      const matchSearch = 
+        p.nameEn?.toLowerCase().includes(catProductSearchTerm.toLowerCase()) || 
+        p.nameBn?.includes(catProductSearchTerm) || 
+        p.sku?.toLowerCase().includes(catProductSearchTerm.toLowerCase());
+
+      if (!matchSearch) return false;
+
+      if (catProductStatusFilter === "active") return p.isAvailable !== false;
+      if (catProductStatusFilter === "disabled") return p.isAvailable === false;
+      if (catProductStatusFilter === "low_stock") return (p.stock || 0) <= 5;
+      return true;
+    })
+    .sort((a, b) => {
+      const orderA = typeof a.displayOrder === "number" ? a.displayOrder : (typeof a.order === "number" ? a.order : 9999);
+      const orderB = typeof b.displayOrder === "number" ? b.displayOrder : (typeof b.order === "number" ? b.order : 9999);
+      return orderA - orderB;
+    });
+
+  // Global search products list
+  const globalFilteredProducts = products
+    .filter(p => !isProductDeleted(p))
+    .filter(p => shouldKeepProductGroceryFiltered(p))
+    .filter(p => matchesProductSearch(p, searchTerm));
+
+  return (
+    <div className="space-y-6 text-slate-700 font-sans">
+      
+      {/* Catalog Sub Navigation */}
+      <div className="flex flex-wrap border-b border-slate-200 shrink-0 gap-1 sm:gap-2">
+        <button 
+          onClick={() => setActiveCatalogSubTab("category_manager")}
+          className={`px-4 sm:px-5 py-2.5 text-xs font-black cursor-pointer uppercase tracking-wider border-b-2 transition flex items-center gap-2 ${
+            activeCatalogSubTab === "category_manager" ? "border-emerald-600 text-emerald-600 bg-emerald-50/50" : "border-transparent text-slate-500 hover:text-slate-800"
+          }`}
+        >
+          <Layers className="w-4 h-4 text-emerald-600" />
+          <span>{getTranslation("ক্যাটাগরি ম্যানেজমেন্ট", "Category Management")}</span>
+        </button>
+
+        <button 
+          onClick={() => setActiveCatalogSubTab("subcategories")}
+          className={`px-4 sm:px-5 py-2.5 text-xs font-black cursor-pointer uppercase tracking-wider border-b-2 transition flex items-center gap-2 ${
+            activeCatalogSubTab === "subcategories" ? "border-emerald-600 text-emerald-600 bg-emerald-50/50" : "border-transparent text-slate-500 hover:text-slate-800"
+          }`}
+        >
+          <Tag className="w-4 h-4 text-emerald-600" />
+          <span>{getTranslation("সাবক্যাটাগরি সাজানো ও অর্ডার", "Subcategory Ordering")}</span>
+          <span className="bg-emerald-100 text-emerald-800 text-[10px] px-1.5 py-0.5 rounded-full font-bold ml-0.5">
+            {subcategories.filter(s => !s.isDeleted).length}
+          </span>
+        </button>
+
+        <button 
+          onClick={() => setActiveCatalogSubTab("bulk")}
+          className={`px-4 sm:px-5 py-2.5 text-xs font-black cursor-pointer uppercase tracking-wider border-b-2 transition ${
+            activeCatalogSubTab === "bulk" ? "border-emerald-600 text-emerald-600 bg-emerald-50/50" : "border-transparent text-slate-500 hover:text-slate-800"
+          }`}
+        >
+          {getTranslation("বাল্ক সিএসভি টুলস", "Bulk CSV Tools")}
+        </button>
+      </div>
+
+      {/* ==================== SUBTAB 1: CATEGORY MANAGER ==================== */}
+      {activeCatalogSubTab === "category_manager" && (
+        <div className="space-y-6">
+          
+          {/* Category Switcher Header */}
+          <div className="bg-white border border-slate-200 p-4 sm:p-5 rounded-2xl shadow-xs space-y-3">
+            <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-3">
+              <div>
+                <span className="text-[10px] font-black uppercase tracking-widest text-emerald-600 bg-emerald-100/80 px-2.5 py-1 rounded-full">
+                  {getTranslation("ক্যাটাগরি হাব", "Category Hub")}
+                </span>
+                <h3 className="text-base sm:text-lg font-black text-slate-800 mt-1">
+                  {getTranslation("ক্যাটাগরি ম্যানেজমেন্ট", "Category Management")}
+                </h3>
+              </div>
+
+              {/* Prominent Add Category Button */}
+              <button
+                type="button"
+                onClick={handleOpenAddCategory}
+                className="bg-emerald-600 hover:bg-emerald-700 text-white px-4 py-2 rounded-xl text-xs font-black flex items-center gap-1.5 cursor-pointer shadow-xs transition uppercase tracking-wider shrink-0"
+              >
+                <Plus className="w-4 h-4" />
+                <span>{getTranslation("নতুন ক্যাটাগরি যুক্ত করুন", "Add Category")}</span>
+              </button>
+            </div>
+
+            {/* Category Selector Buttons */}
+            <div className="flex flex-wrap gap-2 pt-2 border-t border-slate-100">
+              {categories.map((c) => {
+                const isSelected = selectedCatId === c.id;
+                const catProdCount = products
+                  .filter(p => !isProductDeleted(p))
+                  .filter(p => shouldKeepProductGroceryFiltered(p))
+                  .filter(p => isCategoryMatch(p.category || p.categoryId, c.id)).length;
+                return (
+                  <button
+                    key={c.id}
+                    onClick={() => setSelectedCatId(c.id)}
+                    className={`px-3.5 py-2 rounded-xl text-xs font-bold transition flex items-center gap-2 cursor-pointer border ${
+                      isSelected 
+                        ? "bg-emerald-600 text-white border-emerald-600 shadow-sm" 
+                        : "bg-slate-50 text-slate-700 border-slate-200 hover:bg-slate-100"
+                    }`}
+                  >
+                    <span>{getTranslation(c.nameBn, c.nameEn)}</span>
+                    <span className={`text-[10px] px-1.5 py-0.5 rounded-full font-mono font-black ${
+                      isSelected ? "bg-white/20 text-white" : "bg-slate-200 text-slate-600"
+                    }`}>
+                      {catProdCount}
+                    </span>
+                  </button>
+                );
+              })}
+
+              {/* Add Category Pill Button */}
+              <button
+                type="button"
+                onClick={handleOpenAddCategory}
+                className="px-3.5 py-2 rounded-xl text-xs font-bold transition flex items-center gap-1.5 cursor-pointer border border-dashed border-emerald-400 bg-emerald-50 text-emerald-700 hover:bg-emerald-100"
+              >
+                <Plus className="w-3.5 h-3.5" />
+                <span>{getTranslation("নতুন ক্যাটাগরি", "Add Category")}</span>
+              </button>
+            </div>
+          </div>
+
+          {/* Section 1: Category Name & Image Editor */}
+          <div className="bg-white border border-slate-200 p-5 sm:p-6 rounded-2xl shadow-xs space-y-4">
+            <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 border-b border-slate-100 pb-3">
+              <div>
+                <h4 className="text-sm sm:text-base font-black text-slate-800 flex items-center gap-2">
+                  <Edit className="w-4 h-4 text-emerald-600" />
+                  <span>{getTranslation("ক্যাটাগরি তথ্য ও হেডার ইমেজ এডিটর", "Category Profile & Image Editor")}</span>
+                </h4>
+                <p className="text-xs text-slate-400 mt-0.5">
+                  {getTranslation("ক্যাটাগরির বাংলা/ইংরেজি নাম এবং ব্যানার/আইকন পরিবর্তন করুন।", "Update category names, image URL, and upload new media.")}
+                </p>
+              </div>
+
+              <div className="flex items-center gap-2 shrink-0">
+                <span className="text-xs font-mono font-bold text-slate-400 bg-slate-100 px-2.5 py-1 rounded-lg">
+                  ID: {selectedCatId}
+                </span>
+
+                {/* Delete Category Header Button */}
+                <button
+                  type="button"
+                  onClick={() => handleDeleteCategory(selectedCatId)}
+                  className="bg-red-50 hover:bg-red-100 text-red-600 border border-red-200 px-3 py-1 rounded-xl text-xs font-bold flex items-center gap-1 transition cursor-pointer"
+                  title={getTranslation("ক্যাটাগরি ডিলিট করুন", "Delete Category")}
+                >
+                  <Trash2 className="w-3.5 h-3.5" />
+                  <span>{getTranslation("ডিলিট", "Delete")}</span>
+                </button>
+              </div>
+            </div>
+
+            <form onSubmit={handleSaveCategoryDetails} className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+              <div>
+                <label className="text-xs font-black text-slate-700 uppercase block mb-1">
+                  {getTranslation("ক্যাটাগরি নাম (বাংলা) *", "Category Name (Bangla) *")}
+                </label>
+                <input 
+                  type="text" 
+                  required 
+                  value={catNameBn} 
+                  onChange={(e) => setCatNameBn(e.target.value)} 
+                  className="w-full bg-slate-50 border border-slate-200 rounded-xl px-3.5 py-2 text-xs font-bold text-slate-800 outline-none focus:ring-2 focus:ring-emerald-500/20 focus:border-emerald-500"
+                />
+              </div>
+
+              <div>
+                <label className="text-xs font-black text-slate-700 uppercase block mb-1">
+                  {getTranslation("ক্যাটাগরি নাম (ইংরেজি) *", "Category Name (English) *")}
+                </label>
+                <input 
+                  type="text" 
+                  required 
+                  value={catNameEn} 
+                  onChange={(e) => setCatNameEn(e.target.value)} 
+                  className="w-full bg-slate-50 border border-slate-200 rounded-xl px-3.5 py-2 text-xs font-bold text-slate-800 outline-none focus:ring-2 focus:ring-emerald-500/20 focus:border-emerald-500"
+                />
+              </div>
+
+              <div>
+                <label className="text-xs font-black text-slate-700 uppercase block mb-1">
+                  {getTranslation("আইকন নাম (Lucide Icon)", "Icon Name (Lucide)")}
+                </label>
+                <input 
+                  type="text" 
+                  value={catIcon} 
+                  onChange={(e) => setCatIcon(e.target.value)} 
+                  className="w-full bg-slate-50 border border-slate-200 rounded-xl px-3.5 py-2 text-xs font-bold text-slate-800 outline-none focus:ring-2 focus:ring-emerald-500/20 focus:border-emerald-500"
+                />
+              </div>
+
+              {/* Category Image URL & File Upload */}
+              <div className="md:col-span-2 space-y-2">
+                <label className="text-xs font-black text-slate-700 uppercase block">
+                  {getTranslation("ক্যাটাগরি ইমেজ URL অথবা আপলোড", "Category Image URL or Upload")}
+                </label>
+
+                <div className="flex flex-col sm:flex-row gap-2">
+                  <input 
+                    type="url" 
+                    placeholder="https://res.cloudinary.com/... or https://..." 
+                    value={catImage} 
+                    onChange={(e) => setCatImage(e.target.value)} 
+                    className="flex-1 bg-slate-50 border border-slate-200 rounded-xl px-3.5 py-2 text-xs text-slate-800 outline-none focus:ring-2 focus:ring-emerald-500/20 focus:border-emerald-500"
+                  />
+
+                  <input 
+                    type="file" 
+                    ref={catFileInputRef} 
+                    onChange={handleCatImageFileChange} 
+                    accept="image/*" 
+                    className="hidden" 
+                  />
+
+                  <button 
+                    type="button" 
+                    onClick={() => catFileInputRef.current?.click()} 
+                    disabled={uploadingCatImage} 
+                    className="bg-emerald-100 hover:bg-emerald-200 text-emerald-800 px-4 py-2 rounded-xl text-xs font-black flex items-center justify-center gap-1.5 cursor-pointer transition shrink-0"
+                  >
+                    {uploadingCatImage ? <RefreshCw className="w-4 h-4 animate-spin" /> : <Upload className="w-4 h-4" />}
+                    <span>{getTranslation("ছবি আপলোড", "Upload Image")}</span>
+                  </button>
+                </div>
+              </div>
+
+              {/* Category Image Live Preview */}
+              <div className="flex items-center gap-3 bg-slate-50 p-2.5 rounded-xl border border-slate-200">
+                <div className="w-12 h-12 rounded-xl bg-slate-200 border border-slate-300 flex items-center justify-center overflow-hidden shrink-0">
+                  {catImage ? (
+                    <img src={catImage} alt={catNameEn} className="w-full h-full object-cover" />
+                  ) : (
+                    <Salad className="w-6 h-6 text-emerald-600" />
+                  )}
+                </div>
+                <div>
+                  <div className="text-[10px] font-bold text-slate-400 uppercase">{getTranslation("লাইভ প্র প্রিভিউ", "Live Preview")}</div>
+                  <div className="text-xs font-extrabold text-slate-800">{catNameBn || catNameEn || "Category"}</div>
+                </div>
+              </div>
+
+              <div className="md:col-span-2 lg:col-span-3 flex justify-between items-center pt-3 border-t border-slate-100">
+                {/* Delete Button */}
+                <button 
+                  type="button"
+                  onClick={() => handleDeleteCategory(selectedCatId)}
+                  className="bg-red-50 hover:bg-red-100 text-red-600 border border-red-200 px-4 py-2.5 rounded-xl text-xs font-black flex items-center gap-1.5 transition cursor-pointer"
+                >
+                  <Trash2 className="w-4 h-4" />
+                  <span>{getTranslation("ক্যাটাগরি ডিলিট করুন", "Delete Category")}</span>
+                </button>
+
+                {/* Save Changes Button */}
+                <button 
+                  type="submit" 
+                  disabled={savingCategory} 
+                  className="bg-emerald-600 hover:bg-emerald-700 text-white px-6 py-2.5 rounded-xl text-xs font-black flex items-center gap-2 cursor-pointer transition shadow-xs uppercase tracking-wider"
+                >
+                  {savingCategory ? <RefreshCw className="w-4 h-4 animate-spin" /> : <Check className="w-4 h-4" />}
+                  <span>{getTranslation("ক্যাটাগরি আপডেট সেভ করুন", "Save Category Changes")}</span>
+                </button>
+              </div>
+            </form>
+          </div>
+
+          {/* Section 2: Products List in Selected Category ("তাজা শাক ও সবজি") */}
+          <div className="bg-white border border-slate-200 p-5 sm:p-6 rounded-2xl shadow-xs space-y-4">
+            
+            {/* Header & Stat Summary */}
+            <div className="flex flex-col md:flex-row justify-between items-start md:items-center gap-4 border-b border-slate-100 pb-4">
+              <div>
+                <h4 className="text-base sm:text-lg font-black text-slate-800 flex items-center gap-2">
+                  <Layers className="w-5 h-5 text-emerald-600" />
+                  <span>
+                    {getTranslation(`"${catNameBn}" ক্যাটালগ প্রোডাক্টস`, `"${catNameEn}" Product Catalog`)}
+                  </span>
+                </h4>
+                <p className="text-xs text-slate-400 mt-0.5">
+                  {getTranslation("এই ক্যাটাগরির অন্তর্ভুক্ত সব পণ্যের রিওর্ডার, এডিট, ডিলিট ও এনাবল/ডিজেবল কন্ট্রোল।", "Reorder, edit, toggle availability, and add products to this category.")}
+                </p>
+              </div>
+
+              {/* Stats badges */}
+              <div className="flex flex-wrap items-center gap-2">
+                <div className="bg-slate-100 text-slate-700 px-3 py-1.5 rounded-xl text-xs font-extrabold flex items-center gap-1.5">
+                  <span>মোট:</span>
+                  <span className="text-emerald-700 font-mono font-black">{categoryProducts.length}</span>
+                </div>
+                <div className="bg-emerald-50 text-emerald-800 px-3 py-1.5 rounded-xl text-xs font-extrabold flex items-center gap-1.5">
+                  <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600" />
+                  <span>সক্রিয়:</span>
+                  <span className="font-mono font-black">{categoryProducts.filter(p => p.isAvailable !== false).length}</span>
+                </div>
+                <div className="bg-amber-50 text-amber-800 px-3 py-1.5 rounded-xl text-xs font-extrabold flex items-center gap-1.5">
+                  <XCircle className="w-3.5 h-3.5 text-amber-600" />
+                  <span>নিষ্ক্রিয়:</span>
+                  <span className="font-mono font-black">{categoryProducts.filter(p => p.isAvailable === false).length}</span>
+                </div>
+              </div>
+            </div>
+
+            {/* Action Toolbar: Search, Filter, Add Product */}
+            <div className="flex flex-col sm:flex-row gap-3 items-center justify-between">
+              <div className="flex flex-1 flex-col sm:flex-row items-center gap-2 w-full">
+                {/* Search in Category */}
+                <div className="relative w-full sm:w-64">
+                  <Search className="w-4 h-4 text-slate-400 absolute left-3 top-2.5" />
+                  <input 
+                    type="text" 
+                    placeholder={getTranslation("এই ক্যাটাগরির পণ্য খুঁজুন...", "Search in category...")} 
+                    value={catProductSearchTerm}
+                    onChange={(e) => setCatProductSearchTerm(e.target.value)}
+                    className="w-full bg-slate-50 border border-slate-200 rounded-xl pl-9 pr-3 py-2 text-xs focus:ring-2 focus:ring-emerald-500/20 focus:border-emerald-500 outline-none"
+                  />
+                </div>
+
+                {/* Status Filter */}
+                <select 
+                  value={catProductStatusFilter} 
+                  onChange={(e: any) => setCatProductStatusFilter(e.target.value)} 
+                  className="w-full sm:w-auto bg-slate-50 border border-slate-200 rounded-xl px-3 py-2 text-xs font-bold text-slate-700 outline-none"
+                >
+                  <option value="all">{getTranslation("সব স্ট্যাটাস (All)", "All Status")}</option>
+                  <option value="active">{getTranslation("শুধুমাত্র সক্রিয় (Active)", "Active Only")}</option>
+                  <option value="disabled">{getTranslation("শুধুমাত্র নিষ্ক্রিয় (Disabled)", "Disabled Only")}</option>
+                  <option value="low_stock">{getTranslation("স্টক কম (≤ 5)", "Low Stock (≤ 5)")}</option>
+                </select>
+              </div>
+
+              {/* Add New Product to this category */}
+              <button 
+                onClick={() => handleOpenCreateProduct(selectedCatId)}
+                className="w-full sm:w-auto bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl px-4 py-2.5 text-xs font-black flex items-center justify-center gap-2 cursor-pointer transition uppercase tracking-wider shrink-0 shadow-xs"
+              >
+                <Plus className="w-4 h-4" />
+                <span>{getTranslation(`+ নতুন পণ্য যুক্ত করুন`, `+ Add Product`)}</span>
+              </button>
+            </div>
+
+            {/* Category Products Table */}
+            <div className="border border-slate-200 rounded-2xl overflow-hidden shadow-2xs">
+              <div className="overflow-x-auto">
+                <table className="w-full text-left text-xs border-collapse min-w-[620px]">
+                  <thead>
+                    <tr className="bg-slate-50 text-slate-500 font-black uppercase tracking-wider border-b border-slate-200">
+                      <th className="p-3 w-16 text-center">{getTranslation("ক্রম / বিন্যাস", "Order")}</th>
+                      <th className="p-3 w-16">{getTranslation("ছবি", "Image")}</th>
+                      <th className="p-3">{getTranslation("পণ্য ও SKU", "Product & SKU")}</th>
+                      <th className="p-3">{getTranslation("মূল্য", "Price")}</th>
+                      <th className="p-3">{getTranslation("স্টক", "Stock")}</th>
+                      <th className="p-3 text-center">{getTranslation("স্ট্যাটাস (এনাবল)", "Status")}</th>
+                      <th className="p-3 text-right">{getTranslation("অ্যাকশন", "Actions")}</th>
+                    </tr>
+                  </thead>
+
+                  <tbody className="divide-y divide-slate-100 bg-white">
+                    {filteredCategoryProducts.length === 0 ? (
+                      <tr>
+                        <td colSpan={7} className="p-8 text-center text-slate-400 font-bold">
+                          {getTranslation("কোনো পণ্য পাওয়া যায়নি।", "No products found in this category.")}
+                        </td>
+                      </tr>
+                    ) : (
+                      filteredCategoryProducts.map((p, idx) => {
+                        const isAvailable = p.isAvailable !== false;
+                        return (
+                          <tr key={p.id} className={`hover:bg-slate-50/80 transition ${!isAvailable ? "bg-slate-50/50 opacity-75" : ""}`}>
+                            
+                            {/* Reorder Up/Down */}
+                            <td className="p-3 text-center">
+                              <div className="flex flex-col items-center justify-center gap-1">
+                                <div className="flex items-center gap-1">
+                                  <button
+                                    type="button"
+                                    onClick={() => handleReorderProduct(p.id, "up", filteredCategoryProducts)}
+                                    disabled={idx === 0}
+                                    title="Move Up"
+                                    className="p-1 text-slate-400 hover:text-emerald-600 disabled:opacity-20 hover:bg-slate-100 rounded-md cursor-pointer"
+                                  >
+                                    <ArrowUp className="w-3.5 h-3.5" />
+                                  </button>
+                                  <button
+                                    type="button"
+                                    onClick={() => handleReorderProduct(p.id, "down", filteredCategoryProducts)}
+                                    disabled={idx === filteredCategoryProducts.length - 1}
+                                    title="Move Down"
+                                    className="p-1 text-slate-400 hover:text-emerald-600 disabled:opacity-20 hover:bg-slate-100 rounded-md cursor-pointer"
+                                  >
+                                    <ArrowDown className="w-3.5 h-3.5" />
+                                  </button>
+                                </div>
+                                <span className="text-[10px] font-mono font-bold text-slate-400">
+                                  #{idx + 1}
+                                </span>
+                              </div>
+                            </td>
+
+                            {/* Image Thumbnail */}
+                            <td className="p-3">
+                              <div className="w-10 h-10 rounded-xl bg-slate-100 border border-slate-200 overflow-hidden flex items-center justify-center shrink-0">
+                                {p.image || p.imageUrl ? (
+                                  <img 
+                                    src={p.image || p.imageUrl} 
+                                    alt={p.nameEn || p.nameBn} 
+                                    className="w-full h-full object-cover" 
+                                    onError={(e) => {
+                                      const target = (e.currentTarget || e.target) as HTMLImageElement;
+                                      target.onerror = null;
+                                      if (target.dataset.triedFallback === "true") return;
+                                      target.dataset.triedFallback = "true";
+                                      target.src = SAFE_PRODUCT_PLACEHOLDER;
+                                    }}
+                                  />
+                                ) : (
+                                  <ImageIcon className="w-4 h-4 text-slate-300" />
+                                )}
+                              </div>
+                            </td>
+
+                            {/* Product Info & SKU */}
+                            <td className="p-3">
+                              <div className="font-bold text-slate-800 text-xs sm:text-sm">
+                                {getTranslation(p.nameBn, p.nameEn)}
+                              </div>
+                              <div className="flex items-center gap-2 mt-0.5">
+                                <span className="text-[10px] font-mono text-slate-400">
+                                  SKU: {p.sku || p.id}
+                                </span>
+                                <span className="text-[10px] bg-slate-100 text-slate-600 font-bold px-1.5 py-0.2 rounded">
+                                  {getTranslation(p.unitBn, p.unitEn)}
+                                </span>
+                              </div>
+                            </td>
+
+                            {/* Price */}
+                            <td className="p-3">
+                              <div className="font-extrabold text-emerald-700">
+                                ৳{p.price}
+                              </div>
+                              {p.originalPrice > p.price && (
+                                <div className="text-[10px] line-through text-slate-400">
+                                  ৳{p.originalPrice}
+                                </div>
+                              )}
+                            </td>
+
+                            {/* Stock */}
+                            <td className="p-3">
+                              <span className={`px-2 py-0.5 rounded-full text-[10px] font-black ${
+                                (p.stock || 0) <= 5 ? "bg-red-100 text-red-700" : "bg-emerald-100 text-emerald-800"
+                              }`}>
+                                {p.stock || 0} {getTranslation("টি", "pcs")}
+                              </span>
+                            </td>
+
+                            {/* Enable/Disable Switch Toggle */}
+                            <td className="p-3 text-center">
+                              <button
+                                type="button"
+                                onClick={() => handleToggleProductAvailability(p.id, isAvailable)}
+                                className={`px-2.5 py-1 rounded-full text-[10px] font-black transition cursor-pointer flex items-center justify-center gap-1 mx-auto ${
+                                  isAvailable 
+                                    ? "bg-emerald-600 text-white hover:bg-emerald-700 shadow-2xs" 
+                                    : "bg-slate-200 text-slate-600 hover:bg-slate-300"
+                                }`}
+                              >
+                                {isAvailable ? <Eye className="w-3 h-3" /> : <EyeOff className="w-3 h-3" />}
+                                <span>{isAvailable ? getTranslation("সক্রিয়", "Active") : getTranslation("নিষ্ক্রিয়", "Hidden")}</span>
+                              </button>
+                            </td>
+
+                            {/* Edit / Delete Actions */}
+                            <td className="p-3 text-right">
+                              <div className="flex items-center justify-end gap-1">
+                                <button
+                                  type="button"
+                                  onClick={() => handleOpenEditProduct(p)}
+                                  className="p-1.5 text-slate-600 hover:text-emerald-600 rounded-lg hover:bg-emerald-50 transition cursor-pointer"
+                                  title="Edit Product"
+                                >
+                                  <Edit className="w-4 h-4" />
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => handleDeleteProduct(p.id)}
+                                  className="p-1.5 text-slate-400 hover:text-red-600 rounded-lg hover:bg-red-50 transition cursor-pointer"
+                                  title="Delete Product"
+                                >
+                                  <Trash2 className="w-4 h-4" />
+                                </button>
+                              </div>
+                            </td>
+
+                          </tr>
+                        );
+                      })
+                    )}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+
+          </div>
+
+        </div>
+      )}
+
+      {/* ==================== SUBTAB 2: ALL PRODUCTS ==================== */}
+      {activeCatalogSubTab === "products" && (
+        <div className="space-y-4">
+          <div className="flex flex-col sm:flex-row gap-3 items-center justify-between">
+            <input 
+              type="text" 
+              placeholder={getTranslation("সব পণ্য অনুসন্ধান করুন...", "Search all products...")} 
+              value={searchTerm}
+              onChange={(e) => setSearchTerm(e.target.value)}
+              className="w-full sm:max-w-xs bg-slate-50 border border-slate-200 rounded-xl px-4 py-2 text-xs focus:ring-2 focus:ring-emerald-500/20 focus:border-emerald-500 outline-none"
+            />
+            <button 
+              onClick={() => handleOpenCreateProduct()}
+              className="w-full sm:w-auto bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl px-4 py-2 text-xs font-black flex items-center justify-center gap-2 cursor-pointer transition uppercase"
+            >
+              <Plus className="w-4 h-4" />
+              <span>{getTranslation("নতুন পণ্য যুক্ত করুন", "Add Product")}</span>
+            </button>
+          </div>
+
+          <div className="border border-slate-200 rounded-2xl overflow-hidden shadow-2xs">
+            <div className="overflow-x-auto">
+              <table className="w-full text-left text-xs border-collapse min-w-[620px]">
+                <thead>
+                  <tr className="bg-slate-50 text-slate-500 font-black uppercase tracking-wider border-b border-slate-200">
+                    <th className="p-3 w-16">{getTranslation("ছবি", "Image")}</th>
+                    <th className="p-3">{getTranslation("পণ্য নাম", "Product Name")}</th>
+                    <th className="p-3">{getTranslation("ক্যাটাগরি", "Category")}</th>
+                    <th className="p-3">{getTranslation("মূল্য", "Price")}</th>
+                    <th className="p-3">{getTranslation("স্টক", "Stock")}</th>
+                    <th className="p-3 text-center">{getTranslation("স্ট্যাটাস", "Status")}</th>
+                    <th className="p-3 text-right">{getTranslation("অ্যাকশন", "Actions")}</th>
+                  </tr>
+                </thead>
+
+                <tbody className="divide-y divide-slate-100 bg-white">
+                  {globalFilteredProducts.length === 0 ? (
+                    <tr>
+                      <td colSpan={7} className="p-8 text-center text-slate-400 font-bold">
+                        {getTranslation("কোনো পণ্য পাওয়া যায়নি!", "No products found matching query!")}
+                      </td>
+                    </tr>
+                  ) : (
+                    globalFilteredProducts.map((p) => {
+                      const isAvailable = p.isAvailable !== false;
+                      const catInfo = categories.find(c => c.id === p.category || c.id === p.categoryId) || 
+                        (isCategoryMatch(p.category || p.categoryId, "groceries") ? categories.find(c => c.id === "groceries") : undefined) ||
+                        (isCategoryMatch(p.category || p.categoryId, "frozen") ? categories.find(c => c.id === "frozen") : undefined) ||
+                        (isCategoryMatch(p.category || p.categoryId, "snacks-biscuits") ? categories.find(c => c.id === "snacks-biscuits") : undefined);
+                      return (
+                        <tr key={p.id} className="hover:bg-slate-50 transition">
+                          <td className="p-3">
+                            <div className="w-10 h-10 rounded-xl bg-slate-100 border border-slate-200 overflow-hidden flex items-center justify-center shrink-0">
+                              {p.image || p.imageUrl ? (
+                                <img 
+                                  src={p.image || p.imageUrl} 
+                                  alt={p.nameEn || p.nameBn} 
+                                  className="w-full h-full object-cover" 
+                                  onError={(e) => {
+                                    const target = (e.currentTarget || e.target) as HTMLImageElement;
+                                    target.onerror = null;
+                                    if (target.dataset.triedFallback === "true") return;
+                                    target.dataset.triedFallback = "true";
+                                    target.src = SAFE_PRODUCT_PLACEHOLDER;
+                                  }}
+                                />
+                              ) : (
+                                <ImageIcon className="w-4 h-4 text-slate-300" />
+                              )}
+                            </div>
+                          </td>
+                          <td className="p-3 font-bold text-slate-800">
+                            <div>{getTranslation(p.nameBn, p.nameEn)}</div>
+                            <div className="text-[10px] text-slate-400 font-mono font-normal">SKU: {p.sku || p.id}</div>
+                          </td>
+                          <td className="p-3 font-bold text-slate-600">
+                            {catInfo ? getTranslation(catInfo.nameBn, catInfo.nameEn) : p.category}
+                          </td>
+                          <td className="p-3 font-extrabold text-emerald-700">
+                            ৳{p.price}
+                          </td>
+                          <td className="p-3">
+                            <span className={`px-2 py-0.5 rounded-full text-[10px] font-black ${
+                              (p.stock || 0) <= 5 ? "bg-red-100 text-red-700" : "bg-emerald-100 text-emerald-800"
+                            }`}>
+                              {p.stock || 0}
+                            </span>
+                          </td>
+                          <td className="p-3 text-center">
+                            <button
+                              type="button"
+                              onClick={() => handleToggleProductAvailability(p.id, isAvailable)}
+                              className={`px-2.5 py-1 rounded-full text-[10px] font-black transition cursor-pointer flex items-center justify-center gap-1 mx-auto ${
+                                isAvailable ? "bg-emerald-600 text-white" : "bg-slate-200 text-slate-600"
+                              }`}
+                            >
+                              {isAvailable ? <Eye className="w-3 h-3" /> : <EyeOff className="w-3 h-3" />}
+                              <span>{isAvailable ? getTranslation("সক্রিয়", "Active") : getTranslation("নিষ্ক্রিয়", "Hidden")}</span>
+                            </button>
+                          </td>
+                          <td className="p-3 text-right">
+                            <div className="flex items-center justify-end gap-1">
+                              <button
+                                type="button"
+                                onClick={() => handleOpenEditProduct(p)}
+                                className="p-1.5 text-slate-600 hover:text-emerald-600 rounded-lg hover:bg-emerald-50 transition cursor-pointer"
+                              >
+                                <Edit className="w-4 h-4" />
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => handleDeleteProduct(p.id)}
+                                className="p-1.5 text-slate-400 hover:text-red-600 rounded-lg hover:bg-red-50 transition cursor-pointer"
+                              >
+                                <Trash2 className="w-4 h-4" />
+                              </button>
+                            </div>
+                          </td>
+                        </tr>
+                      );
+                    })
+                  )}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ==================== PRODUCT FORM OVERLAY ==================== */}
+      {showProductForm && typeof document !== "undefined" && createPortal(
+        <div 
+          id="admin-product-form-overlay"
+          onClick={(e) => {
+            if (e.target === e.currentTarget) {
+              setShowProductForm(false);
+            }
+          }}
+          className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/50 backdrop-blur-sm overflow-y-auto animate-fade-in"
+        >
+          <div 
+            onClick={(e) => e.stopPropagation()}
+            className="max-h-[85vh] sm:max-h-[90vh] flex flex-col w-full max-w-2xl bg-white rounded-2xl shadow-xl overflow-hidden relative z-10"
+          >
+            {/* Modal Header */}
+            <div className="flex-shrink-0 p-4 sm:p-5 border-b border-slate-100 flex items-center justify-between bg-slate-50/50">
+              <div className="flex items-center space-x-2.5">
+                <div className="w-8 h-8 rounded-xl bg-emerald-50 text-emerald-600 flex items-center justify-center font-bold border border-emerald-100 shrink-0">
+                  <Layers className="w-4 h-4" />
+                </div>
+                <div className="min-w-0">
+                  <h3 className="text-sm sm:text-base font-black text-slate-800 truncate">
+                    {editingProduct ? getTranslation("পণ্য তথ্য এডিট করুন", "Edit Product Details") : getTranslation("নতুন পণ্য যুক্ত করুন", "Create New Product")}
+                  </h3>
+                  <p className="text-[10px] text-slate-400 font-bold uppercase tracking-wider truncate">
+                    {getTranslation("সঠিক তথ্য পূরণ করে সেভ করুন", "Fill required fields and save")}
+                  </p>
+                </div>
+              </div>
+              <button 
+                type="button"
+                onClick={() => setShowProductForm(false)}
+                className="p-1.5 sm:px-2.5 sm:py-1.5 text-slate-400 hover:text-slate-700 rounded-xl hover:bg-slate-100 transition cursor-pointer flex items-center space-x-1.5 border border-slate-200 shrink-0"
+                title={getTranslation("বন্ধ করুন", "Close")}
+              >
+                <X className="w-4 h-4" />
+                <span className="text-xs font-bold hidden sm:inline">{getTranslation("বন্ধ করুন", "Close")}</span>
+              </button>
+            </div>
+
+            {/* Form */}
+            <form onSubmit={handleSaveProduct} className="flex flex-col flex-1 min-h-0 overflow-hidden">
+              {/* Scrollable Form Body */}
+              <div className="overflow-y-auto flex-1 p-6 space-y-4">
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4 text-xs">
+              <div>
+                <label className="font-bold text-slate-700 block mb-1">
+                  {getTranslation("মূল ক্যাটাগরি (Main Category) *", "Main Category *")}
+                </label>
+                <select 
+                  value={prodCategory} 
+                  required
+                  onChange={(e) => {
+                    const newCat = e.target.value;
+                    const isNewRest = isCategoryMatch(newCat, "restaurant") || newCat === "bakery-sweets" || newCat === "restaurant" || newCat === "রেস্টুরেন্ট";
+                    const isNewDryFood = isCategoryMatch(newCat, "frozen") || newCat === "frozen" || newCat === "dry-food" || newCat === "dryfood" || newCat === "ড্রাই ফুড";
+                    const effectiveNewCat = isNewRest ? "bakery-sweets" : (isNewDryFood ? "frozen" : newCat);
+                    setProdCategory(effectiveNewCat);
+                    const matchingSubs = isNewRest
+                      ? RESTAURANT_SUBCATEGORIES.map(s => ({ id: s.id, categoryId: "bakery-sweets", nameBn: s.nameBn, nameEn: s.nameEn, order: s.order }))
+                      : subcategories
+                          .filter(s => (s.categoryId === effectiveNewCat || (isNewDryFood && (s.categoryId === "frozen" || s.categoryId === "dry-food"))) && !s.isDeleted)
+                          .sort((a, b) => (a.order || 0) - (b.order || 0));
+                    if (matchingSubs.length > 0) {
+                      setProdSubcategoryId(matchingSubs[0].id);
+                      setProdSubcategory(matchingSubs[0].nameBn || (matchingSubs[0] as any).nameEn);
+                    } else {
+                      setProdSubcategoryId("");
+                      setProdSubcategory(isNewDryFood ? "ড্রাই ফুড" : "");
+                    }
+                  }}
+                  className="w-full bg-slate-50 border border-slate-200 rounded-xl px-3 py-2 text-xs font-bold text-slate-800 outline-none focus:ring-2 focus:ring-emerald-500/20 focus:border-emerald-500"
+                >
+                  <option value="">{getTranslation("-- ক্যাটাগরি নির্বাচন করুন --", "-- Select Category --")}</option>
+                  {categories.map(c => (
+                    <option key={c.id} value={c.id}>{getTranslation(c.nameBn, c.nameEn)}</option>
+                  ))}
+                </select>
+              </div>
+
+              <div>
+                <label className="font-bold text-slate-700 block mb-1">
+                  {getTranslation("সাবক্যাটাগরি (Subcategory)", "Subcategory")}
+                </label>
+                {(() => {
+                  const isCurrentRest = isCategoryMatch(prodCategory, "restaurant") || prodCategory === "bakery-sweets" || prodCategory === "restaurant" || prodCategory === "রেস্টুরেন্ট";
+                  const isCurrentDryFood = isCategoryMatch(prodCategory, "frozen") || prodCategory === "frozen" || prodCategory === "dry-food" || prodCategory === "ড্রাই ফুড";
+                  const availableSubs = isCurrentRest
+                    ? RESTAURANT_SUBCATEGORIES.map(s => ({ id: s.id, categoryId: "bakery-sweets", nameBn: s.nameBn, nameEn: s.nameEn, order: s.order }))
+                    : subcategories
+                        .filter(s => (s.categoryId === prodCategory || (isCurrentDryFood && (s.categoryId === "frozen" || s.categoryId === "dry-food"))) && !s.isDeleted)
+                        .sort((a, b) => (a.order || 0) - (b.order || 0));
+
+                  return (
+                    <select 
+                      value={prodSubcategoryId} 
+                      onChange={(e) => {
+                        const subId = e.target.value;
+                        setProdSubcategoryId(subId);
+                        const foundSub = availableSubs.find(s => s.id === subId) || subcategories.find(s => s.id === subId);
+                        if (foundSub) {
+                          setProdSubcategory(foundSub.nameBn || (foundSub as any).nameEn);
+                        } else {
+                          setProdSubcategory("");
+                        }
+                      }}
+                      className="w-full bg-slate-50 border border-slate-200 rounded-xl px-3 py-2 text-xs font-bold text-slate-800 outline-none focus:ring-2 focus:ring-emerald-500/20 focus:border-emerald-500"
+                    >
+                      <option value="">
+                        {availableSubs.length === 0
+                          ? getTranslation("-- কোনো সাবক্যাটাগরি নেই --", "-- No Subcategories Available --")
+                          : getTranslation("-- সাবক্যাটাগরি নির্বাচন করুন --", "-- Select Subcategory --")
+                        }
+                      </option>
+                      {availableSubs.map(s => (
+                        <option key={s.id} value={s.id}>
+                          {s.order ? `[#${s.order}] ` : ""}{getTranslation(s.nameBn, (s as any).nameEn)}
+                        </option>
+                      ))}
+                    </select>
+                  );
+                })()}
+              </div>
+
+              <div>
+                <label className="font-bold text-slate-700 block mb-1">SKU Code</label>
+                <input type="text" value={prodSku} onChange={(e) => setProdSku(e.target.value)} className="w-full bg-slate-50 border border-slate-200 rounded-xl px-3 py-2 text-xs font-mono" />
+              </div>
+
+              <div>
+                <label className="font-bold text-slate-700 block mb-1">{getTranslation("পণ্যের নাম (বাংলা) *", "Product Name (Bangla) *")}</label>
+                <input type="text" required value={prodNameBn} onChange={(e) => setProdNameBn(e.target.value)} className="w-full bg-slate-50 border border-slate-200 rounded-xl px-3 py-2 text-xs" />
+              </div>
+
+              <div>
+                <label className="font-bold text-slate-700 block mb-1">{getTranslation("পণ্যের নাম (English) *", "Product Name (English) *")}</label>
+                <input type="text" required value={prodNameEn} onChange={(e) => setProdNameEn(e.target.value)} className="w-full bg-slate-50 border border-slate-200 rounded-xl px-3 py-2 text-xs" />
+              </div>
+
+              <div>
+                <label className="font-bold text-slate-700 block mb-1">{getTranslation("মূল্য (৳) *", "Price (৳) *")}</label>
+                <input type="number" required value={prodPrice} onChange={(e) => setProdPrice(Number(e.target.value))} className="w-full bg-slate-50 border border-slate-200 rounded-xl px-3 py-2 text-xs font-bold text-emerald-700" />
+              </div>
+
+              <div>
+                <label className="font-bold text-slate-700 block mb-1">{getTranslation("পূর্ববর্তী মূল্য (৳)", "Original Price (৳)")}</label>
+                <input type="number" value={prodOrigPrice} onChange={(e) => setProdOrigPrice(Number(e.target.value))} className="w-full bg-slate-50 border border-slate-200 rounded-xl px-3 py-2 text-xs" />
+              </div>
+
+              <div>
+                <label className="font-bold text-slate-700 block mb-1">{getTranslation("একক (বাংলা)", "Unit (Bangla)")}</label>
+                <input type="text" value={prodUnitBn} onChange={(e) => setProdUnitBn(e.target.value)} placeholder="১ কেজি" className="w-full bg-slate-50 border border-slate-200 rounded-xl px-3 py-2 text-xs" />
+              </div>
+
+              <div>
+                <label className="font-bold text-slate-700 block mb-1">{getTranslation("একক (English)", "Unit (English)")}</label>
+                <input type="text" value={prodUnitEn} onChange={(e) => setProdUnitEn(e.target.value)} placeholder="1 kg" className="w-full bg-slate-50 border border-slate-200 rounded-xl px-3 py-2 text-xs" />
+              </div>
+
+              <div>
+                <label className="font-bold text-slate-700 block mb-1">{getTranslation("স্টক সংখ্যা *", "Stock Quantity *")}</label>
+                <input type="number" required value={prodStock} onChange={(e) => setProdStock(Number(e.target.value))} className="w-full bg-slate-50 border border-slate-200 rounded-xl px-3 py-2 text-xs" />
+              </div>
+
+              <div>
+                <label className="font-bold text-slate-700 block mb-1">{getTranslation("ব্র্যান্ড", "Brand")}</label>
+                <input type="text" value={prodBrand} onChange={(e) => setProdBrand(e.target.value)} placeholder="Kacha Bazar" className="w-full bg-slate-50 border border-slate-200 rounded-xl px-3 py-2 text-xs" />
+              </div>
+
+              {/* Product Image Field & Upload */}
+              <div className="md:col-span-2 space-y-1">
+                <label className="font-bold text-slate-700 block">{getTranslation("পণ্যের ছবি URL / ক্লাউডিনারি আপলোড", "Product Image URL / Cloudinary Upload")}</label>
+                <div className="flex gap-2">
+                  <input type="url" placeholder="https://images.unsplash.com/..." value={prodImage} onChange={(e) => setProdImage(e.target.value)} className="flex-1 bg-slate-50 border border-slate-200 rounded-xl px-3 py-2 text-xs" />
+                  <input type="file" ref={fileInputRef} onChange={handleImageFileChange} accept="image/*" className="hidden" />
+                  <button type="button" onClick={() => fileInputRef.current?.click()} disabled={uploadingImage} className="bg-emerald-50 hover:bg-emerald-100 text-emerald-700 border border-emerald-200 px-3 py-2 rounded-xl text-xs font-bold flex items-center gap-1 shrink-0 cursor-pointer">
+                    {uploadingImage ? <RefreshCw className="w-4 h-4 animate-spin" /> : <Upload className="w-4 h-4" />}
+                    <span>{uploadingImage ? getTranslation("আপলোড হচ্ছে...", "Uploading...") : getTranslation("ছবি আপলোড", "Upload Image")}</span>
+                  </button>
+                </div>
+                {/* Product Image Live Preview Box */}
+                {prodImage && (
+                  <div className="flex items-center gap-3 bg-slate-50 p-2.5 rounded-xl border border-slate-200 mt-2">
+                    <div className="w-14 h-14 rounded-xl bg-white border border-slate-200 flex items-center justify-center overflow-hidden shrink-0 shadow-2xs">
+                      <img 
+                        src={prodImage} 
+                        alt="Preview" 
+                        className="w-full h-full object-cover" 
+                        onError={(e) => {
+                          const target = (e.currentTarget || e.target) as HTMLImageElement;
+                          target.onerror = null;
+                          if (target.dataset.triedFallback === "true") return;
+                          target.dataset.triedFallback = "true";
+                          target.src = SAFE_PRODUCT_PLACEHOLDER;
+                        }}
+                      />
+                    </div>
+                    <div className="text-xs text-slate-600 truncate flex-1 min-w-0">
+                      <p className="font-bold text-slate-800 text-[11px]">{getTranslation("ছবির প্রিভিউ (সফলভাবে সংযুক্ত)", "Image Preview (Attached)")}</p>
+                      <p className="text-[10px] truncate text-slate-400 mt-0.5">{prodImage}</p>
+                    </div>
+                    <button 
+                      type="button" 
+                      onClick={() => setProdImage("")} 
+                      className="text-rose-500 hover:text-rose-700 hover:bg-rose-50 p-1.5 rounded-lg text-xs font-bold transition shrink-0 cursor-pointer"
+                      title={getTranslation("ছবি মুছুন", "Remove Image")}
+                    >
+                      <X className="w-4 h-4" />
+                    </button>
+                  </div>
+                )}
+              </div>
+
+              {/* Description */}
+              <div>
+                <label className="font-bold text-slate-700 block mb-1">{getTranslation("বিবরণ (বাংলা)", "Description (Bangla)")}</label>
+                <textarea rows={2} value={prodDescBn} onChange={(e) => setProdDescBn(e.target.value)} className="w-full bg-slate-50 border border-slate-200 rounded-xl p-2 text-xs"></textarea>
+              </div>
+
+              <div>
+                <label className="font-bold text-slate-700 block mb-1">{getTranslation("বিবরণ (English)", "Description (English)")}</label>
+                <textarea rows={2} value={prodDescEn} onChange={(e) => setProdDescEn(e.target.value)} className="w-full bg-slate-50 border border-slate-200 rounded-xl p-2 text-xs"></textarea>
+              </div>
+
+              {/* Product Options (Weight/Size variations) */}
+              <div className="md:col-span-2 bg-slate-50 p-3 rounded-2xl space-y-2 border border-slate-200">
+                <div className="font-bold text-slate-800 text-xs">{getTranslation("ওজন ও মূল্য বৈচিত্র্য (Weight Options)", "Weight Options")}</div>
+                <div className="flex flex-wrap gap-2 items-center">
+                  <input type="number" placeholder="Value (250)" value={newOptValue} onChange={(e) => setNewOptValue(e.target.value)} className="w-24 bg-white border border-slate-200 rounded-lg px-2 py-1 text-xs" />
+                  <select value={newOptUnit} onChange={(e) => setNewOptUnit(e.target.value)} className="bg-white border border-slate-200 rounded-lg px-2 py-1 text-xs">
+                    <option value="g">g</option>
+                    <option value="kg">kg</option>
+                    <option value="ml">ml</option>
+                    <option value="L">L</option>
+                    <option value="pcs">pcs</option>
+                  </select>
+                  <input type="number" placeholder="Price (৳)" value={newOptPrice} onChange={(e) => setNewOptPrice(e.target.value)} className="w-24 bg-white border border-slate-200 rounded-lg px-2 py-1 text-xs" />
+                  <button type="button" onClick={handleAddOption} className="bg-emerald-600 text-white px-3 py-1 rounded-lg text-xs font-bold cursor-pointer">{getTranslation("যোগ করুন", "Add Option")}</button>
+                </div>
+
+                {prodOptions.length > 0 && (
+                  <div className="flex flex-wrap gap-2 pt-2">
+                    {prodOptions.map((opt) => (
+                      <div key={opt.id} className="bg-white border border-slate-200 px-2.5 py-1 rounded-lg text-xs font-bold flex items-center gap-2">
+                        <span>{opt.value} {opt.unit} - ৳{opt.price}</span>
+                        <button type="button" onClick={() => handleRemoveOption(opt.id)} className="text-red-500 hover:text-red-700 cursor-pointer"><X className="w-3.5 h-3.5" /></button>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+
+              {/* Availability Toggle */}
+              <div className="md:col-span-2 flex items-center justify-between bg-emerald-50/60 p-3 rounded-xl border border-emerald-100">
+                <label className="font-bold text-emerald-900 text-xs flex items-center gap-2 cursor-pointer">
+                  <input 
+                    type="checkbox" 
+                    checked={prodIsAvailable} 
+                    onChange={(e) => setProdIsAvailable(e.target.checked)} 
+                    className="w-4 h-4 text-emerald-600 rounded focus:ring-emerald-500"
+                  />
+                  <span>{getTranslation("পণ্যটি ক্যাটালগে সক্রিয় ও প্রদর্শনের জন্য উন্মুক্ত রাখুন", "Keep product active and visible to shoppers")}</span>
+                </label>
+              </div>
+
+                </div>
+              </div>
+
+              {/* Fixed Footer */}
+              <div className="flex-shrink-0 p-4 border-t border-slate-100 flex flex-wrap gap-2 justify-end bg-gray-50/50">
+                <button type="button" onClick={() => setShowProductForm(false)} className="px-4 py-2 bg-slate-200 hover:bg-slate-300 text-slate-700 rounded-xl text-xs font-bold transition cursor-pointer">{getTranslation("বাতিল", "Cancel")}</button>
+                <button type="submit" disabled={savingProduct} className="px-5 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-black shadow transition flex items-center gap-1.5 cursor-pointer disabled:opacity-50">
+                  {savingProduct && <RefreshCw className="w-3.5 h-3.5 animate-spin" />}
+                  <span>{getTranslation("সংরক্ষণ করুন", "Save Product")}</span>
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>,
+        document.body
+      )}
+
+      {/* ==================== SUBTAB 3: ALL CATEGORIES MANAGEMENT ==================== */}
+      {activeCatalogSubTab === "categories" && (() => {
+        const PRIORITY_ORDER_MAP: Record<string, number> = {
+          "vegetables": 1,
+          "groceries": 2,
+          "staples": 2,
+          "spices-oils": 2,
+          "bakery-sweets": 3,
+          "restaurant": 3,
+          "bakery": 3,
+          "fish": 4,
+          "snacks-biscuits": 5,
+          "confectionery": 5,
+          "beverages": 5,
+          "meat": 6,
+          "fruits": 7,
+          "dairy-eggs": 8,
+          "frozen": 9,
+          "cosmetics": 10,
+          "personal-care": 10,
+          "household": 11,
+          "pharmacy": 12,
+          "baby-care": 12,
+          "offers": 13,
+          "buy-sell": 14,
+          "organic-herbal": 14,
+          "buysell": 14,
+          "pet-care": 15,
+          "pet-food-care": 16,
+          "vehicles": 17,
+          "transport": 17,
+          "car-rental": 17,
+          "mobile-zone": 18,
+          "mobile": 18,
+          "mobiles": 18
+        };
+        const sortedAllCats = categories
+          .filter(c => c.id !== "all" && c.id !== "home-appliances" && !((c.nameBn === "মোবাইল জোন" || c.nameEn === "Mobile Zone") && c.id !== "mobile-zone"))
+          .sort((a, b) => {
+          const orderA = typeof a.displayOrder === "number" ? a.displayOrder : (typeof a.order === "number" ? a.order : (PRIORITY_ORDER_MAP[a.id] ?? 9999));
+          const orderB = typeof b.displayOrder === "number" ? b.displayOrder : (typeof b.order === "number" ? b.order : (PRIORITY_ORDER_MAP[b.id] ?? 9999));
+          return orderA - orderB;
+        });
+
+        const filteredCats = sortedAllCats.filter(c => {
+          const matchesSearch = 
+            (c.nameBn || "").toLowerCase().includes(catSearchTerm.toLowerCase()) ||
+            (c.nameEn || "").toLowerCase().includes(catSearchTerm.toLowerCase()) ||
+            (c.id || "").toLowerCase().includes(catSearchTerm.toLowerCase());
+          
+          const isAvail = c.isAvailable !== false && c.disabled !== true;
+          const matchesStatus = 
+            catStatusFilter === "all" ? true :
+            catStatusFilter === "active" ? isAvail :
+            !isAvail;
+
+          return matchesSearch && matchesStatus;
+        });
+
+        const totalCount = sortedAllCats.length;
+        const activeCount = sortedAllCats.filter(c => c.isAvailable !== false && c.disabled !== true).length;
+        const disabledCount = sortedAllCats.filter(c => c.isAvailable === false || c.disabled === true).length;
+
+        return (
+          <div className="space-y-5">
+            {/* Summary Stat Cards */}
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+              <div className="bg-white border border-slate-200 p-4 rounded-2xl shadow-xs flex items-center justify-between">
+                <div>
+                  <span className="text-[10px] font-black uppercase text-slate-400 tracking-wider block mb-0.5">
+                    {getTranslation("মোট ক্যাটাগরি", "Total Categories")}
+                  </span>
+                  <div className="text-xl font-black text-slate-800">{totalCount}</div>
+                </div>
+                <div className="w-10 h-10 rounded-xl bg-slate-100 flex items-center justify-center text-slate-700">
+                  <Grid className="w-5 h-5" />
+                </div>
+              </div>
+
+              <div className="bg-white border border-emerald-100 p-4 rounded-2xl shadow-xs flex items-center justify-between">
+                <div>
+                  <span className="text-[10px] font-black uppercase text-emerald-600 tracking-wider block mb-0.5">
+                    {getTranslation("সক্রিয় ক্যাটাগরি", "Active Categories")}
+                  </span>
+                  <div className="text-xl font-black text-emerald-600">{activeCount}</div>
+                </div>
+                <div className="w-10 h-10 rounded-xl bg-emerald-50 flex items-center justify-center text-emerald-600">
+                  <CheckCircle2 className="w-5 h-5" />
+                </div>
+              </div>
+
+              <div className="bg-white border border-slate-200 p-4 rounded-2xl shadow-xs flex items-center justify-between">
+                <div>
+                  <span className="text-[10px] font-black uppercase text-slate-400 tracking-wider block mb-0.5">
+                    {getTranslation("বন্ধ / হিডেন ক্যাটাগরি", "Disabled Categories")}
+                  </span>
+                  <div className="text-xl font-black text-slate-500">{disabledCount}</div>
+                </div>
+                <div className="w-10 h-10 rounded-xl bg-slate-100 flex items-center justify-center text-slate-400">
+                  <XCircle className="w-5 h-5" />
+                </div>
+              </div>
+            </div>
+
+            {/* Action Bar & Controls */}
+            <div className="bg-white border border-slate-200 p-4 rounded-2xl shadow-xs flex flex-col md:flex-row justify-between items-stretch md:items-center gap-3">
+              <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2 flex-1">
+                {/* Search input */}
+                <div className="relative flex-1">
+                  <Search className="w-4 h-4 text-slate-400 absolute left-3 top-2.5" />
+                  <input
+                    type="text"
+                    placeholder={getTranslation("ক্যাটাগরি নাম বা আইডি সার্চ করুন...", "Search category by name or ID...")}
+                    value={catSearchTerm}
+                    onChange={(e) => setCatSearchTerm(e.target.value)}
+                    className="w-full bg-slate-50 border border-slate-200 rounded-xl pl-9 pr-3 py-2 text-xs font-medium text-slate-800 outline-none focus:ring-2 focus:ring-emerald-500/20 focus:border-emerald-500"
+                  />
+                  {catSearchTerm && (
+                    <button onClick={() => setCatSearchTerm("")} className="absolute right-3 top-2.5 text-slate-400 hover:text-slate-600">
+                      <X className="w-3.5 h-3.5" />
+                    </button>
+                  )}
+                </div>
+
+                {/* Status Filter */}
+                <div className="flex items-center gap-1 bg-slate-50 border border-slate-200 p-1 rounded-xl shrink-0">
+                  <button
+                    onClick={() => setCatStatusFilter("all")}
+                    className={`px-3 py-1 text-xs font-bold rounded-lg transition cursor-pointer ${catStatusFilter === "all" ? "bg-white text-slate-800 shadow-xs" : "text-slate-500 hover:text-slate-800"}`}
+                  >
+                    {getTranslation("সব", "All")} ({totalCount})
+                  </button>
+                  <button
+                    onClick={() => setCatStatusFilter("active")}
+                    className={`px-3 py-1 text-xs font-bold rounded-lg transition cursor-pointer ${catStatusFilter === "active" ? "bg-emerald-600 text-white shadow-xs" : "text-slate-500 hover:text-slate-800"}`}
+                  >
+                    {getTranslation("সক্রিয়", "Active")} ({activeCount})
+                  </button>
+                  <button
+                    onClick={() => setCatStatusFilter("disabled")}
+                    className={`px-3 py-1 text-xs font-bold rounded-lg transition cursor-pointer ${catStatusFilter === "disabled" ? "bg-slate-700 text-white shadow-xs" : "text-slate-500 hover:text-slate-800"}`}
+                  >
+                    {getTranslation("বন্ধ", "Disabled")} ({disabledCount})
+                  </button>
+                </div>
+              </div>
+
+              {/* Add New Category Button */}
+              <button
+                onClick={handleOpenAddCategory}
+                className="bg-emerald-600 hover:bg-emerald-700 text-white px-4 py-2.5 rounded-xl text-xs font-black flex items-center justify-center gap-2 cursor-pointer shadow-xs transition uppercase tracking-wider shrink-0"
+              >
+                <Plus className="w-4 h-4" />
+                <span>{getTranslation("নতুন ক্যাটাগরি যুক্ত করুন", "Add New Category")}</span>
+              </button>
+            </div>
+
+            {/* Category Table / Card Grid */}
+            <div className="bg-white border border-slate-200 rounded-2xl shadow-xs overflow-hidden">
+              <div className="overflow-x-auto">
+                <table className="w-full text-left border-collapse min-w-[620px]">
+                  <thead>
+                    <tr className="bg-slate-50 border-b border-slate-200 text-[10px] font-black uppercase text-slate-500 tracking-wider">
+                      <th className="py-3 px-4 text-center w-20">{getTranslation("অর্ডার / রিঅর্ডার", "Reorder")}</th>
+                      <th className="py-3 px-4">{getTranslation("ক্যাটাগরি ইমেজ ও আইকন", "Category Media")}</th>
+                      <th className="py-3 px-4">{getTranslation("ক্যাটাগরি তথ্য (Bangla / English)", "Category Info")}</th>
+                      <th className="py-3 px-4 text-center">{getTranslation("পণ্য সংখ্যা", "Products")}</th>
+                      <th className="py-3 px-4 text-center">{getTranslation("স্ট্যাটাস (এনাবল / ডিসেবল)", "Status")}</th>
+                      <th className="py-3 px-4 text-right">{getTranslation("অ্যাকশন", "Actions")}</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-100 text-xs">
+                    {filteredCats.length === 0 ? (
+                      <tr>
+                        <td colSpan={6} className="text-center py-10 text-slate-400 font-medium">
+                          {getTranslation("কোনো ক্যাটাগরি খুঁজে পাওয়া যায়নি।", "No categories found matching filter criteria.")}
+                        </td>
+                      </tr>
+                    ) : (
+                      filteredCats.map((c, idx) => {
+                        const isAvail = c.isAvailable !== false && c.disabled !== true;
+                        const catProductsCount = products
+                          .filter(p => !isProductDeleted(p))
+                          .filter(p => shouldKeepProductGroceryFiltered(p))
+                          .filter(p => isCategoryMatch(p.category || p.categoryId, c.id)).length;
+                        const displayIdx = typeof c.displayOrder === "number" ? c.displayOrder : idx + 1;
+
+                        return (
+                          <tr key={c.id} className={`hover:bg-slate-50/80 transition ${!isAvail ? "bg-slate-50/50 text-slate-400" : ""}`}>
+                            {/* Reorder Buttons */}
+                            <td className="py-3 px-4 text-center">
+                              <div className="flex items-center justify-center gap-1">
+                                <span className="text-[10px] font-mono font-bold text-slate-400 bg-slate-100 px-1.5 py-0.5 rounded">
+                                  #{displayIdx}
+                                </span>
+                                <div className="flex flex-col gap-0.5">
+                                  <button
+                                    type="button"
+                                    disabled={idx === 0}
+                                    onClick={() => handleReorderCategory(c.id, "up", sortedAllCats)}
+                                    className="p-1 hover:bg-slate-200 text-slate-600 rounded disabled:opacity-20 cursor-pointer"
+                                    title="Move Up"
+                                  >
+                                    <ArrowUp className="w-3 h-3" />
+                                  </button>
+                                  <button
+                                    type="button"
+                                    disabled={idx === sortedAllCats.length - 1}
+                                    onClick={() => handleReorderCategory(c.id, "down", sortedAllCats)}
+                                    className="p-1 hover:bg-slate-200 text-slate-600 rounded disabled:opacity-20 cursor-pointer"
+                                    title="Move Down"
+                                  >
+                                    <ArrowDown className="w-3 h-3" />
+                                  </button>
+                                </div>
+                              </div>
+                            </td>
+
+                            {/* Image Thumbnail & Icon */}
+                            <td className="py-3 px-4">
+                              <div className="flex items-center gap-2">
+                                <div 
+                                  className="w-11 h-11 rounded-full bg-slate-100 border border-slate-200 overflow-hidden flex items-center justify-center shrink-0"
+                                  style={{ borderRadius: "50%" }}
+                                >
+                                  {c.image || c.imageUrl ? (
+                                    <img 
+                                      src={c.image || c.imageUrl} 
+                                      alt={c.nameEn} 
+                                      className="w-full h-full object-cover rounded-full" 
+                                      style={{ width: "100%", height: "100%", objectFit: "cover", borderRadius: "50%" }}
+                                    />
+                                  ) : (
+                                    renderCategoryIcon(c.iconName)
+                                  )}
+                                </div>
+                                <span className={`text-[10px] font-mono px-2 py-0.5 rounded-md border font-bold ${c.colorClass || "bg-slate-100 text-slate-600"} ${c.borderColor || "border-slate-200"}`}>
+                                  {c.iconName || "Salad"}
+                                </span>
+                              </div>
+                            </td>
+
+                            {/* Category Info */}
+                            <td className="py-3 px-4">
+                              <div className="space-y-0.5">
+                                <div className="font-extrabold text-slate-800 text-sm">{c.nameBn}</div>
+                                <div className="text-xs text-slate-500 font-medium">{c.nameEn}</div>
+                                <div className="text-[10px] font-mono text-slate-400 uppercase">Slug ID: {c.id}</div>
+                              </div>
+                            </td>
+
+                            {/* Product Count */}
+                            <td className="py-3 px-4 text-center">
+                              <span className="bg-emerald-50 text-emerald-700 font-mono font-bold text-xs px-2.5 py-1 rounded-full border border-emerald-100 inline-block">
+                                {catProductsCount} {getTranslation("পণ্য", "Items")}
+                              </span>
+                            </td>
+
+                            {/* Availability Toggle */}
+                            <td className="py-3 px-4 text-center">
+                              <button
+                                type="button"
+                                onClick={() => handleToggleCategoryAvailability(c.id, isAvail)}
+                                className={`px-3 py-1.5 rounded-xl text-xs font-bold border transition cursor-pointer flex items-center gap-1.5 mx-auto ${
+                                  isAvail 
+                                    ? "bg-emerald-50 text-emerald-700 border-emerald-200 hover:bg-emerald-100" 
+                                    : "bg-slate-100 text-slate-500 border-slate-200 hover:bg-slate-200"
+                                }`}
+                              >
+                                {isAvail ? <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600" /> : <XCircle className="w-3.5 h-3.5 text-slate-400" />}
+                                <span>{isAvail ? getTranslation("সক্রিয় (Active)", "Enabled") : getTranslation("বন্ধ (Disabled)", "Disabled")}</span>
+                              </button>
+                            </td>
+
+                            {/* Actions */}
+                            <td className="py-3 px-4 text-right">
+                              <div className="flex items-center justify-end gap-1.5">
+                                {/* Manage products button */}
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    setSelectedCatId(c.id);
+                                    setActiveCatalogSubTab("category_manager");
+                                  }}
+                                  className="bg-emerald-50 hover:bg-emerald-100 text-emerald-700 px-2.5 py-1.5 rounded-lg text-xs font-bold flex items-center gap-1 cursor-pointer transition border border-emerald-200"
+                                  title="Manage category products"
+                                >
+                                  <Layers className="w-3.5 h-3.5" />
+                                  <span className="hidden sm:inline">{getTranslation("ম্যানেজ", "Manage")}</span>
+                                </button>
+
+                                {/* Edit category modal button */}
+                                <button
+                                  type="button"
+                                  onClick={() => handleOpenEditCategory(c)}
+                                  className="p-1.5 text-slate-600 hover:text-emerald-600 hover:bg-emerald-50 rounded-lg transition cursor-pointer"
+                                  title="Edit category info"
+                                >
+                                  <Edit className="w-4 h-4" />
+                                </button>
+
+                                {/* Delete category button */}
+                                <button
+                                  type="button"
+                                  onClick={() => handleDeleteCategory(c.id)}
+                                  className="p-1.5 text-slate-400 hover:text-red-600 hover:bg-red-50 rounded-lg transition cursor-pointer"
+                                  title="Delete category"
+                                >
+                                  <Trash2 className="w-4 h-4" />
+                                </button>
+                              </div>
+                            </td>
+                          </tr>
+                        );
+                      })
+                    )}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+        );
+      })()}
+
+      {/* ==================== SUBTAB 3: SUBCATEGORY ORDERING MANAGEMENT ==================== */}
+      {activeCatalogSubTab === "subcategories" && (() => {
+        const filteredSubs = subcategories
+          .filter(s => !s.isDeleted)
+          .filter(s => selectedSubcatCategoryFilter === "all" || s.categoryId === selectedSubcatCategoryFilter)
+          .sort((a, b) => (a.order || 0) - (b.order || 0));
+
+        return (
+          <div className="space-y-6">
+            {/* Header Control Box */}
+            <div className="bg-white border border-slate-200 p-5 rounded-2xl shadow-xs space-y-4">
+              <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-3">
+                <div>
+                  <div className="flex items-center gap-2">
+                    <span className="p-2 bg-emerald-50 text-emerald-700 rounded-xl">
+                      <Tag className="w-5 h-5" />
+                    </span>
+                    <div>
+                      <h3 className="text-sm sm:text-base font-black text-slate-800">
+                        {getTranslation("সাবক্যাটাগরি সাজানো ও অগ্রাধিকার ক্রম (Subcategory Ordering Management)", "Subcategory Ordering Management")}
+                      </h3>
+                      <p className="text-xs text-slate-400 mt-0.5">
+                        {getTranslation(
+                          "প্রতিটি ক্যাটাগরির সাবক্যাটাগরিগুলোর ক্রম (1, 2, 3...) নির্ধারণ করুন। ফ্রন্টএন্ডে orderBy('order', 'asc') দিয়ে এই ক্রমানুসারে প্রদর্শিত হবে।",
+                          "Set order numbers (1, 2, 3...) or swap positions using arrows. The frontend fetches subcategories sorted by orderBy('order', 'asc')."
+                        )}
+                      </p>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="flex flex-wrap items-center gap-2 w-full sm:w-auto">
+                  <button
+                    type="button"
+                    onClick={() => handleOpenAddSubcategory(selectedSubcatCategoryFilter !== "all" ? selectedSubcatCategoryFilter : "groceries")}
+                    className="flex-1 sm:flex-none px-4 py-2 bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl text-xs font-black shadow transition flex items-center justify-center gap-1.5 cursor-pointer uppercase tracking-wider"
+                  >
+                    <Plus className="w-4 h-4" />
+                    <span>{getTranslation("নতুন সাবক্যাটাগরি", "Add Subcategory")}</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={async () => {
+                      const count = await bootstrapInitialSubcategoriesIfNeeded();
+                      triggerToast(
+                        `ডিফল্ট সাবক্যাটাগরি সিঙ্ক্রোনাইজেশন সম্পন্ন! (${count}টি সাবক্যাটাগরি)`,
+                        `Default subcategories synced! (${count} items)`
+                      );
+                    }}
+                    className="p-2 border border-slate-200 text-slate-600 hover:bg-slate-50 rounded-xl transition cursor-pointer"
+                    title={getTranslation("ডিফল্ট সাবক্যাটাগরি রিলোড / সিড করুন", "Bootstrap default subcategories")}
+                  >
+                    <RefreshCw className="w-4 h-4" />
+                  </button>
+                </div>
+              </div>
+
+              {/* Category Filter Selector */}
+              <div className="pt-3 border-t border-slate-100 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3">
+                <div className="flex items-center gap-2 w-full sm:w-auto">
+                  <label className="text-xs font-bold text-slate-600 shrink-0">
+                    {getTranslation("ক্যাটাগরি ফিল্টার:", "Filter Category:")}
+                  </label>
+                  <select
+                    value={selectedSubcatCategoryFilter}
+                    onChange={(e) => setSelectedSubcatCategoryFilter(e.target.value)}
+                    className="bg-slate-50 border border-slate-200 rounded-xl px-3 py-1.5 text-xs font-bold text-slate-800 outline-none focus:ring-2 focus:ring-emerald-500/20"
+                  >
+                    <option value="all">{getTranslation("সকল ক্যাটাগরি (All Categories)", "All Categories")}</option>
+                    {categories.map(c => (
+                      <option key={c.id} value={c.id}>{getTranslation(c.nameBn, c.nameEn)}</option>
+                    ))}
+                  </select>
+                </div>
+
+                <div className="text-xs font-bold text-slate-500">
+                  {getTranslation("মোট সাবক্যাটাগরি:", "Total Subcategories:")}{" "}
+                  <span className="text-emerald-700 font-extrabold">{filteredSubs.length}</span>
+                </div>
+              </div>
+            </div>
+
+            {/* Subcategories Table */}
+            <div className="bg-white border border-slate-200 rounded-2xl shadow-xs overflow-hidden">
+              <div className="overflow-x-auto">
+                <table className="w-full text-left text-xs border-collapse">
+                  <thead>
+                    <tr className="bg-slate-50/80 border-b border-slate-200 text-slate-600 font-black uppercase tracking-wider text-[11px]">
+                      <th className="p-3.5 text-center w-28">{getTranslation("অর্ডার নম্বর", "Order #")}</th>
+                      <th className="p-3.5">{getTranslation("সাবক্যাটাগরি নাম (বাংলা / English)", "Subcategory Name")}</th>
+                      <th className="p-3.5">{getTranslation("মূল ক্যাটাগরি", "Parent Category")}</th>
+                      <th className="p-3.5 text-center">{getTranslation("সংযুক্ত পণ্য", "Products")}</th>
+                      <th className="p-3.5 text-center w-36">{getTranslation("ক্রম পরিবর্তন", "Move Order")}</th>
+                      <th className="p-3.5 text-right w-24">{getTranslation("অ্যাকশন", "Actions")}</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-100 font-medium">
+                    {filteredSubs.length === 0 ? (
+                      <tr>
+                        <td colSpan={6} className="p-8 text-center text-slate-400 font-bold">
+                          {getTranslation("এই ক্যাটাগরিতে কোনো সাবক্যাটাগরি পাওয়া যায়নি", "No subcategories found in this category")}
+                        </td>
+                      </tr>
+                    ) : (
+                      filteredSubs.map((sub, idx) => {
+                        const parentCat = categories.find(c => c.id === sub.categoryId);
+                        const assignedProdCount = products.filter(
+                          p => !isProductDeleted(p) && (p.subcategoryId === sub.id || (p.category === sub.categoryId && p.subcategory === sub.nameBn))
+                        ).length;
+
+                        return (
+                          <tr key={sub.id} className="hover:bg-slate-50/70 transition">
+                            {/* Order Number Input */}
+                            <td className="p-3 text-center">
+                              <div className="inline-flex items-center gap-1.5">
+                                <span className="text-slate-400 font-mono text-[10px]">#</span>
+                                <input
+                                  type="number"
+                                  min="1"
+                                  defaultValue={sub.order || (idx + 1)}
+                                  key={`order-${sub.id}-${sub.order}`}
+                                  onBlur={(e) => {
+                                    const val = parseInt(e.target.value, 10);
+                                    if (!isNaN(val) && val !== sub.order) {
+                                      handleUpdateSubcategoryOrder(sub.id, val);
+                                    }
+                                  }}
+                                  onKeyDown={(e) => {
+                                    if (e.key === "Enter") {
+                                      const val = parseInt((e.target as HTMLInputElement).value, 10);
+                                      if (!isNaN(val) && val !== sub.order) {
+                                        handleUpdateSubcategoryOrder(sub.id, val);
+                                        (e.target as HTMLInputElement).blur();
+                                      }
+                                    }
+                                  }}
+                                  className="w-14 px-2 py-1 text-center font-mono font-bold text-xs bg-emerald-50/70 border border-emerald-200 text-emerald-800 rounded-lg outline-none focus:ring-2 focus:ring-emerald-500/20"
+                                  title={getTranslation("সরাসরি সংখ্যা লিখে Enter চাপুন বা বাইরে ক্লিক করুন", "Edit number and press Enter to save order")}
+                                />
+                              </div>
+                            </td>
+
+                            {/* Subcategory Name */}
+                            <td className="p-3">
+                              <div className="font-extrabold text-slate-800 text-xs sm:text-sm">
+                                {sub.nameBn}
+                              </div>
+                              <div className="text-[11px] text-slate-400 font-mono">
+                                {sub.nameEn || sub.nameBn}
+                              </div>
+                            </td>
+
+                            {/* Parent Category */}
+                            <td className="p-3">
+                              <span className="inline-flex items-center gap-1 bg-slate-100 text-slate-700 px-2.5 py-1 rounded-full text-[11px] font-bold">
+                                {parentCat ? getTranslation(parentCat.nameBn, parentCat.nameEn) : sub.categoryId}
+                              </span>
+                            </td>
+
+                            {/* Products count */}
+                            <td className="p-3 text-center font-bold font-mono text-slate-600">
+                              <span className="bg-emerald-50 text-emerald-700 px-2 py-0.5 rounded-full text-xs font-bold">
+                                {assignedProdCount}
+                              </span>
+                            </td>
+
+                            {/* Move Up / Down Buttons */}
+                            <td className="p-3 text-center">
+                              <div className="inline-flex items-center gap-1 bg-slate-100 p-1 rounded-xl">
+                                <button
+                                  type="button"
+                                  onClick={() => handleMoveSubcategory(sub, "up")}
+                                  disabled={idx === 0}
+                                  className="p-1 text-slate-600 hover:text-emerald-700 hover:bg-white rounded-lg transition cursor-pointer disabled:opacity-30 disabled:cursor-not-allowed"
+                                  title={getTranslation("উপরে নিন (Priority Up)", "Move Up")}
+                                >
+                                  <ArrowUp className="w-3.5 h-3.5" />
+                                </button>
+                                <span className="text-[10px] text-slate-400 font-mono px-0.5">|</span>
+                                <button
+                                  type="button"
+                                  onClick={() => handleMoveSubcategory(sub, "down")}
+                                  disabled={idx === filteredSubs.length - 1}
+                                  className="p-1 text-slate-600 hover:text-emerald-700 hover:bg-white rounded-lg transition cursor-pointer disabled:opacity-30 disabled:cursor-not-allowed"
+                                  title={getTranslation("নিচে নিন (Priority Down)", "Move Down")}
+                                >
+                                  <ArrowDown className="w-3.5 h-3.5" />
+                                </button>
+                              </div>
+                            </td>
+
+                            {/* Actions */}
+                            <td className="p-3 text-right">
+                              <div className="flex items-center justify-end gap-1">
+                                <button
+                                  type="button"
+                                  onClick={() => handleOpenEditSubcategory(sub)}
+                                  className="p-1.5 text-slate-600 hover:text-emerald-600 hover:bg-emerald-50 rounded-lg transition cursor-pointer"
+                                  title={getTranslation("এডিট করুন", "Edit Subcategory")}
+                                >
+                                  <Edit className="w-4 h-4" />
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => handleDeleteSubcategory(sub)}
+                                  className="p-1.5 text-slate-400 hover:text-red-600 hover:bg-red-50 rounded-lg transition cursor-pointer"
+                                  title={getTranslation("মুছে ফেলুন", "Delete Subcategory")}
+                                >
+                                  <Trash2 className="w-4 h-4" />
+                                </button>
+                              </div>
+                            </td>
+                          </tr>
+                        );
+                      })
+                    )}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+        );
+      })()}
+
+      {/* ==================== SUBTAB 4: BULK CSV TOOLS ==================== */}
+      {activeCatalogSubTab === "bulk" && (
+        <div className="bg-white border border-slate-200 p-5 rounded-2xl shadow-xs space-y-4">
+          <div>
+            <h3 className="text-xs font-black text-slate-400 uppercase tracking-widest mb-1">{getTranslation("বাল্ক ক্যাটালগ সিএসভি মডিউল", "Bulk Catalog CSV Module")}</h3>
+            <p className="text-xs text-slate-400">{getTranslation("সিএসভি ডাটা ফরম্যাট দিয়ে ক্যাটালগে দ্রুত নতুন পণ্য যুক্ত করুন অথবা ডাউনলোড করুন।", "Instantly download current dataset or add bulk items to inventory with comma-separated values.")}</p>
+          </div>
+
+          <div className="flex gap-2">
+            <button 
+              onClick={handleExportCSV}
+              className="bg-emerald-600 hover:bg-emerald-700 text-white px-4 py-2 rounded-xl text-xs font-black flex items-center gap-1.5 cursor-pointer uppercase"
+            >
+              <Download className="w-4 h-4" />
+              <span>{getTranslation("সব পণ্য ডাউনলোড (CSV)", "Export Products to CSV")}</span>
+            </button>
+          </div>
+
+          <div className="border-t border-slate-100 pt-4 space-y-2">
+            <label className="text-[10px] font-bold text-slate-400 uppercase block">{getTranslation("সিএসভি ডাটা পেস্ট করুন", "Paste CSV payload data")}</label>
+            <div className="text-[10px] text-emerald-600 font-bold p-2 bg-emerald-50 rounded-lg font-mono">
+              {getTranslation(
+                "ফরম্যাটঃ nameEn,nameBn,price,stock,category,unitEn,unitBn",
+                "Header format: nameEn,nameBn,price,stock,category,unitEn,unitBn"
+              )}
+            </div>
+            <textarea 
+              rows={6}
+              placeholder="Fresh Tomato,দেশি টমেটো,60,100,vegetables,1 kg,১ কেজি"
+              value={bulkCsvText}
+              onChange={(e) => setBulkCsvText(e.target.value)}
+              className="w-full bg-slate-50 border border-slate-200 rounded-2xl p-3 text-xs font-mono outline-none focus:ring-2 focus:ring-emerald-500/20 focus:border-emerald-500"
+            ></textarea>
+            
+            <button 
+              onClick={handleImportCSV}
+              disabled={importingBulk}
+              className="bg-slate-900 hover:bg-black text-white px-5 py-2.5 rounded-xl text-xs font-black flex items-center gap-2 cursor-pointer uppercase transition"
+            >
+              {importingBulk ? <RefreshCw className="w-4 h-4 animate-spin" /> : <Upload className="w-4 h-4" />}
+              <span>{getTranslation("পণ্য বাল্ক আপলোড করুন", "Execute Batch CSV Import")}</span>
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* ==================== ADD / EDIT CATEGORY MODAL ==================== */}
+      {showCategoryModal && typeof document !== "undefined" && createPortal(
+        <div 
+          id="admin-category-form-overlay"
+          onClick={(e) => {
+            if (e.target === e.currentTarget) {
+              setShowCategoryModal(false);
+            }
+          }}
+          className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/50 backdrop-blur-sm overflow-y-auto animate-fade-in"
+        >
+          <div 
+            onClick={(e) => e.stopPropagation()}
+            className="max-h-[85vh] sm:max-h-[90vh] flex flex-col w-full max-w-2xl bg-white rounded-2xl shadow-xl overflow-hidden relative z-10"
+          >
+            {/* Modal Header */}
+            <div className="flex-shrink-0 p-4 sm:p-5 border-b border-slate-100 flex items-center justify-between bg-slate-50/50">
+              <div className="min-w-0">
+                <span className="text-[10px] font-black uppercase text-emerald-600 bg-emerald-50 px-2 py-0.5 rounded-md inline-block">
+                  {editingCategoryModal ? getTranslation("ক্যাটাগরি আপডেট", "Edit Category") : getTranslation("নতুন ক্যাটাগরি", "New Category")}
+                </span>
+                <h3 className="text-sm sm:text-base font-black text-slate-800 mt-1 truncate">
+                  {editingCategoryModal 
+                    ? getTranslation(`"${editingCategoryModal.nameBn}" এডিট করুন`, `Edit Category "${editingCategoryModal.nameEn}"`)
+                    : getTranslation("নতুন ক্যাটাগরি তৈরি করুন", "Create New Category")
+                  }
+                </h3>
+              </div>
+              <button 
+                type="button"
+                onClick={() => setShowCategoryModal(false)}
+                className="p-1.5 sm:px-2.5 sm:py-1.5 text-slate-400 hover:text-slate-700 rounded-xl hover:bg-slate-100 transition cursor-pointer flex items-center space-x-1.5 border border-slate-200 shrink-0"
+                title={getTranslation("বন্ধ করুন", "Close")}
+              >
+                <X className="w-4 h-4" />
+                <span className="text-xs font-bold hidden sm:inline">{getTranslation("বন্ধ করুন", "Close")}</span>
+              </button>
+            </div>
+
+            {/* Form */}
+            <form onSubmit={handleSaveCategoryModal} className="flex flex-col flex-1 min-h-0 overflow-hidden">
+              {/* Scrollable Modal Form Body */}
+              <div className="overflow-y-auto flex-1 p-6 space-y-4">
+              {/* Category ID (Slug) */}
+              <div>
+                <label className="text-xs font-black text-slate-700 uppercase block mb-1">
+                  {getTranslation("ক্যাটাগরি ইউনিক আইডি (Slug ID) *", "Category Slug ID *")}
+                </label>
+                <input 
+                  type="text" 
+                  required 
+                  disabled={!!editingCategoryModal}
+                  placeholder="e.g. fresh_fruits, spices, snacks"
+                  value={modalCatId} 
+                  onChange={(e) => setModalCatId(e.target.value)} 
+                  className="w-full bg-slate-50 border border-slate-200 rounded-xl px-3.5 py-2 text-xs font-mono font-bold text-slate-800 outline-none focus:ring-2 focus:ring-emerald-500/20 focus:border-emerald-500 disabled:opacity-60"
+                />
+                <span className="text-[10px] text-slate-400 block mt-0.5">
+                  {editingCategoryModal 
+                    ? getTranslation("ক্যাটাগরি আইডি পরিবর্তনযোগ্য নয়", "System slug ID cannot be changed once created")
+                    : getTranslation("ছোট হাতের ইংরেজি অক্ষর ও আন্ডারস্কোর ব্যবহার করুন (e.g. organic_honey)", "Use lowercase letters and underscores")
+                  }
+                </span>
+              </div>
+
+              {/* Bangla Name & English Name */}
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <div>
+                  <label className="text-xs font-black text-slate-700 uppercase block mb-1">
+                    {getTranslation("ক্যাটাগরি নাম (বাংলা) *", "Category Name (Bangla) *")}
+                  </label>
+                  <input 
+                    type="text" 
+                    required 
+                    placeholder="e.g. তাজা ফলমূল"
+                    value={modalCatNameBn} 
+                    onChange={(e) => setModalCatNameBn(e.target.value)} 
+                    className="w-full bg-slate-50 border border-slate-200 rounded-xl px-3.5 py-2 text-xs font-bold text-slate-800 outline-none focus:ring-2 focus:ring-emerald-500/20 focus:border-emerald-500"
+                  />
+                </div>
+
+                <div>
+                  <label className="text-xs font-black text-slate-700 uppercase block mb-1">
+                    {getTranslation("ক্যাটাগরি নাম (ইংরেজি) *", "Category Name (English) *")}
+                  </label>
+                  <input 
+                    type="text" 
+                    required 
+                    placeholder="e.g. Fresh Fruits"
+                    value={modalCatNameEn} 
+                    onChange={(e) => setModalCatNameEn(e.target.value)} 
+                    className="w-full bg-slate-50 border border-slate-200 rounded-xl px-3.5 py-2 text-xs font-bold text-slate-800 outline-none focus:ring-2 focus:ring-emerald-500/20 focus:border-emerald-500"
+                  />
+                </div>
+              </div>
+
+              {/* Icon presets & Custom Icon */}
+              <div>
+                <label className="text-xs font-black text-slate-700 uppercase block mb-1">
+                  {getTranslation("আইকন নির্বাচন করুন (Lucide Icon)", "Icon Selection")}
+                </label>
+                <div className="flex flex-wrap gap-1.5 mb-2">
+                  {["Salad", "Milk", "Apple", "Fish", "Flame", "Coffee", "Sparkles", "Package", "ShoppingBag"].map((ic) => (
+                    <button
+                      key={ic}
+                      type="button"
+                      onClick={() => setModalCatIcon(ic)}
+                      className={`px-2.5 py-1 rounded-lg text-xs font-bold flex items-center gap-1 border cursor-pointer transition ${
+                        modalCatIcon === ic ? "bg-emerald-600 text-white border-emerald-600 shadow-xs" : "bg-slate-50 text-slate-600 border-slate-200 hover:bg-slate-100"
+                      }`}
+                    >
+                      {renderCategoryIcon(ic)}
+                      <span>{ic}</span>
+                    </button>
+                  ))}
+                </div>
+                <input 
+                  type="text" 
+                  placeholder="Custom icon name e.g. Sparkles"
+                  value={modalCatIcon} 
+                  onChange={(e) => setModalCatIcon(e.target.value)} 
+                  className="w-full bg-slate-50 border border-slate-200 rounded-xl px-3 py-1.5 text-xs text-slate-800 outline-none"
+                />
+              </div>
+
+              {/* Category Image URL & File Upload */}
+              <div className="space-y-2">
+                <label className="text-xs font-black text-slate-700 uppercase block">
+                  {getTranslation("ক্যাটাগরি ইমেজ URL অথবা ক্লাউড আপলোড", "Category Image URL or Cloud Upload")}
+                </label>
+                <div className="flex gap-2">
+                  <input 
+                    type="url" 
+                    placeholder="https://res.cloudinary.com/... or https://..." 
+                    value={modalCatImage} 
+                    onChange={(e) => setModalCatImage(e.target.value)} 
+                    className="flex-1 bg-slate-50 border border-slate-200 rounded-xl px-3.5 py-2 text-xs text-slate-800 outline-none focus:ring-2 focus:ring-emerald-500/20 focus:border-emerald-500"
+                  />
+                  <input 
+                    type="file" 
+                    ref={modalCatFileInputRef} 
+                    onChange={handleModalCatImageFileChange} 
+                    accept="image/*" 
+                    className="hidden" 
+                  />
+                  <button 
+                    type="button" 
+                    onClick={() => modalCatFileInputRef.current?.click()} 
+                    disabled={uploadingModalCatImage} 
+                    className="bg-emerald-100 hover:bg-emerald-200 text-emerald-800 px-3.5 py-2 rounded-xl text-xs font-black flex items-center gap-1.5 cursor-pointer transition shrink-0"
+                  >
+                    {uploadingModalCatImage ? <RefreshCw className="w-4 h-4 animate-spin" /> : <Upload className="w-4 h-4" />}
+                    <span>{getTranslation("আপলোড", "Upload")}</span>
+                  </button>
+                </div>
+
+                {/* Preview Box */}
+                <div className="flex items-center gap-3 bg-slate-50 p-2.5 rounded-xl border border-slate-200">
+                  <div className="w-12 h-12 rounded-xl bg-slate-200 border border-slate-300 flex items-center justify-center overflow-hidden shrink-0">
+                    {modalCatImage ? (
+                      <img src={modalCatImage} alt="Preview" className="w-full h-full object-cover" />
+                    ) : (
+                      renderCategoryIcon(modalCatIcon)
+                    )}
+                  </div>
+                  <div>
+                    <div className="text-[10px] font-bold text-slate-400 uppercase">{getTranslation("লাইভ প্র প্রিভিউ", "Image Preview")}</div>
+                    <div className="text-xs font-extrabold text-slate-800">{modalCatNameBn || modalCatNameEn || "Category Name"}</div>
+                  </div>
+                </div>
+              </div>
+
+              {/* Display Order & Active Status */}
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 pt-2 border-t border-slate-100">
+                <div>
+                  <label className="text-xs font-black text-slate-700 uppercase block mb-1">
+                    {getTranslation("ডিসপ্লে পজিশন নম্বর", "Display Order Number")}
+                  </label>
+                  <input 
+                    type="number" 
+                    value={modalCatDisplayOrder} 
+                    onChange={(e) => setModalCatDisplayOrder(Number(e.target.value))} 
+                    className="w-full bg-slate-50 border border-slate-200 rounded-xl px-3.5 py-2 text-xs font-bold text-slate-800 outline-none"
+                  />
+                </div>
+
+                <div className="flex items-end pb-1">
+                  <label className="flex items-center gap-2 cursor-pointer select-none text-xs font-bold text-slate-700">
+                    <input 
+                      type="checkbox" 
+                      checked={modalCatIsAvailable} 
+                      onChange={(e) => setModalCatIsAvailable(e.target.checked)} 
+                      className="w-4 h-4 text-emerald-600 rounded focus:ring-emerald-500"
+                    />
+                    <span>{getTranslation("স্টোরে সক্রিয় ও দৃশ্যমান রাখুন", "Enable in store front")}</span>
+                  </label>
+                </div>
+              </div>
+              </div>
+
+              {/* Fixed Modal Footer Buttons */}
+              <div className="flex-shrink-0 p-4 border-t border-slate-100 flex flex-wrap gap-2 justify-end bg-gray-50/50">
+                <button 
+                  type="button" 
+                  onClick={() => setShowCategoryModal(false)}
+                  className="px-4 py-2 bg-slate-200 hover:bg-slate-300 text-slate-700 rounded-xl text-xs font-bold transition cursor-pointer"
+                >
+                  {getTranslation("বাতিল", "Cancel")}
+                </button>
+                <button 
+                  type="submit" 
+                  disabled={savingCategoryModal}
+                  className="px-5 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-black shadow transition flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
+                >
+                  {savingCategoryModal && <RefreshCw className="w-3.5 h-3.5 animate-spin" />}
+                  <span>{getTranslation("সেভ করুন", "Save Category")}</span>
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>,
+        document.body
+      )}
+
+      {/* ==================== ADD / EDIT SUBCATEGORY MODAL ==================== */}
+      {showSubcategoryModal && typeof document !== "undefined" && createPortal(
+        <div 
+          onClick={(e) => {
+            if (e.target === e.currentTarget) {
+              setShowSubcategoryModal(false);
+            }
+          }}
+          className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/50 backdrop-blur-sm overflow-y-auto animate-fade-in"
+        >
+          <div 
+            onClick={(e) => e.stopPropagation()}
+            className="max-h-[85vh] sm:max-h-[90vh] flex flex-col w-full max-w-lg bg-white rounded-2xl shadow-xl overflow-hidden relative z-10"
+          >
+            {/* Header */}
+            <div className="flex-shrink-0 p-4 sm:p-5 border-b border-slate-100 flex items-center justify-between bg-slate-50/50">
+              <div>
+                <span className="text-[10px] font-black uppercase text-emerald-600 bg-emerald-50 px-2 py-0.5 rounded-md inline-block">
+                  {editingSubcategory ? getTranslation("সাবক্যাটাগরি আপডেট", "Edit Subcategory") : getTranslation("নতুন সাবক্যাটাগরি", "New Subcategory")}
+                </span>
+                <h3 className="text-sm sm:text-base font-black text-slate-800 mt-1">
+                  {editingSubcategory
+                    ? getTranslation(`"${editingSubcategory.nameBn}" এডিট করুন`, `Edit Subcategory "${editingSubcategory.nameEn || editingSubcategory.nameBn}"`)
+                    : getTranslation("নতুন সাবক্যাটাগরি যুক্ত করুন", "Add New Subcategory")
+                  }
+                </h3>
+              </div>
+              <button 
+                type="button"
+                onClick={() => setShowSubcategoryModal(false)}
+                className="p-1.5 text-slate-400 hover:text-slate-700 rounded-xl hover:bg-slate-100 transition cursor-pointer border border-slate-200"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            {/* Form */}
+            <form onSubmit={handleSaveSubcategory} className="flex flex-col flex-1 min-h-0 overflow-hidden">
+              <div className="overflow-y-auto flex-1 p-6 space-y-4 text-xs">
+                {/* Parent Category */}
+                <div>
+                  <label className="font-bold text-slate-700 block mb-1">
+                    {getTranslation("মূল ক্যাটাগরি (Parent Category) *", "Parent Category *")}
+                  </label>
+                  <select 
+                    value={subModalCategoryId} 
+                    onChange={(e) => setSubModalCategoryId(e.target.value)}
+                    required
+                    className="w-full bg-slate-50 border border-slate-200 rounded-xl px-3 py-2 text-xs font-bold text-slate-800 outline-none focus:ring-2 focus:ring-emerald-500/20"
+                  >
+                    {categories.map(c => (
+                      <option key={c.id} value={c.id}>{getTranslation(c.nameBn, c.nameEn)}</option>
+                    ))}
+                  </select>
+                </div>
+
+                {/* Name Bangla */}
+                <div>
+                  <label className="font-bold text-slate-700 block mb-1">
+                    {getTranslation("সাবক্যাটাগরির নাম (বাংলা) *", "Subcategory Name (Bangla) *")}
+                  </label>
+                  <input 
+                    type="text" 
+                    required 
+                    placeholder="e.g. চাল ও খাদ্যশস্য"
+                    value={subModalNameBn} 
+                    onChange={(e) => setSubModalNameBn(e.target.value)} 
+                    className="w-full bg-slate-50 border border-slate-200 rounded-xl px-3 py-2 text-xs font-bold text-slate-800 outline-none focus:ring-2 focus:ring-emerald-500/20"
+                  />
+                </div>
+
+                {/* Name English */}
+                <div>
+                  <label className="font-bold text-slate-700 block mb-1">
+                    {getTranslation("সাবক্যাটাগরির নাম (English)", "Subcategory Name (English)")}
+                  </label>
+                  <input 
+                    type="text" 
+                    placeholder="e.g. Rice & Grains"
+                    value={subModalNameEn} 
+                    onChange={(e) => setSubModalNameEn(e.target.value)} 
+                    className="w-full bg-slate-50 border border-slate-200 rounded-xl px-3 py-2 text-xs font-bold text-slate-800 outline-none focus:ring-2 focus:ring-emerald-500/20"
+                  />
+                </div>
+
+                {/* Order Field */}
+                <div>
+                  <label className="font-bold text-slate-700 block mb-1">
+                    {getTranslation("ক্রম / সিরিয়াল নম্বর (Order) *", "Sequence Order Number (1, 2, 3...) *")}
+                  </label>
+                  <input 
+                    type="number" 
+                    min="1"
+                    required
+                    value={subModalOrder} 
+                    onChange={(e) => setSubModalOrder(Number(e.target.value))} 
+                    className="w-full bg-slate-50 border border-slate-200 rounded-xl px-3 py-2 text-xs font-bold font-mono text-slate-800 outline-none focus:ring-2 focus:ring-emerald-500/20"
+                  />
+                  <p className="text-[10px] text-slate-400 mt-1">
+                    {getTranslation("ছোট সংখ্যাগুলো আগে প্রদর্শিত হবে (১, ২, ৩...)। ফ্রন্টএন্ড এই সংখ্যা অনুযায়ী সাজাবে।", "Lower numbers appear first (1, 2, 3...). Frontend sorts by this field.")}
+                  </p>
+                </div>
+              </div>
+
+              {/* Footer */}
+              <div className="flex-shrink-0 p-4 border-t border-slate-100 flex justify-end gap-2 bg-gray-50/50">
+                <button 
+                  type="button" 
+                  onClick={() => setShowSubcategoryModal(false)}
+                  className="px-4 py-2 bg-slate-200 hover:bg-slate-300 text-slate-700 rounded-xl text-xs font-bold transition cursor-pointer"
+                >
+                  {getTranslation("বাতিল", "Cancel")}
+                </button>
+                <button 
+                  type="submit" 
+                  disabled={savingSubModal}
+                  className="px-5 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-black shadow transition flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
+                >
+                  {savingSubModal && <RefreshCw className="w-3.5 h-3.5 animate-spin" />}
+                  <span>{getTranslation("সংরক্ষণ করুন", "Save Subcategory")}</span>
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>,
+        document.body
+      )}
+
+      {/* Product Delete Confirmation Modal */}
+      <DeleteProductConfirmModal
+        isOpen={!!productPendingDelete}
+        product={productPendingDelete}
+        orders={orders}
+        user={user}
+        lang={lang}
+        onClose={() => setProductPendingDelete(null)}
+        onSuccess={handleDeleteSuccess}
+        triggerToast={triggerToast}
+      />
+
+    </div>
+  );
+}

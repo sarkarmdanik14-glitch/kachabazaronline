@@ -1,0 +1,127 @@
+<!doctype html>
+<html lang="bn">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <script>
+      (function() {
+        // Clear any old stale service worker registrations and caches to prevent module chunk mismatches
+        if ('serviceWorker' in navigator) {
+          navigator.serviceWorker.getRegistrations().then(function(regs) {
+            for (var i = 0; i < regs.length; i++) {
+              regs[i].unregister();
+            }
+          }).catch(function() {});
+        }
+        if ('caches' in window) {
+          caches.keys().then(function(keys) {
+            for (var i = 0; i < keys.length; i++) {
+              caches.delete(keys[i]);
+            }
+          }).catch(function() {});
+        }
+
+        // Intercept noisy third-party browser extension console messages (e.g. MetaMask, ChromeTransport)
+        const isExtensionNoise = function(args) {
+          try {
+            var fullStr = '';
+            for (var i = 0; i < args.length; i++) {
+              var a = args[i];
+              if (a === null || a === undefined) continue;
+              if (typeof a === 'string') {
+                fullStr += ' ' + a;
+              } else if (typeof a === 'object') {
+                if (a.message) fullStr += ' ' + a.message;
+                if (a.stack) fullStr += ' ' + a.stack;
+                if (a.name) fullStr += ' ' + a.name;
+                if (a.reason) fullStr += ' ' + (typeof a.reason === 'string' ? a.reason : (a.reason.message || ''));
+                if (typeof a.toString === 'function') {
+                  try {
+                    var s = a.toString();
+                    if (s && s !== '[object Object]') fullStr += ' ' + s;
+                  } catch(e) {}
+                }
+                try { fullStr += ' ' + JSON.stringify(a); } catch(e) {}
+              } else {
+                fullStr += ' ' + String(a);
+              }
+            }
+            return /metamask|chrometransport|connectchrome|inpage\.js|chrome-extension|moz-extension|evmprovider|ethereum/i.test(fullStr);
+          } catch(e) {
+            return false;
+          }
+        };
+
+        const methods = ['error', 'warn', 'info', 'debug', 'log'];
+        methods.forEach(function(method) {
+          const orig = console[method];
+          if (orig) {
+            console[method] = function() {
+              if (isExtensionNoise(arguments)) return;
+              try {
+                return orig.apply(console, arguments);
+              } catch(e) {}
+            };
+          }
+        });
+
+        window.addEventListener('error', function(event) {
+          var msg = (event.message || '') + ' ' + (event.filename || '') + ' ';
+          try {
+            if (event.error) {
+              msg += (event.error.message || '') + ' ' + (event.error.stack || '') + ' ' + String(event.error);
+            }
+          } catch(e) {}
+          if (/metamask|chrometransport|connectchrome|inpage\.js|chrome-extension|moz-extension|evmprovider|ethereum/i.test(msg)) {
+            event.preventDefault();
+            event.stopPropagation();
+            if (typeof event.stopImmediatePropagation === 'function') event.stopImmediatePropagation();
+            return true;
+          }
+        }, true);
+
+        window.addEventListener('unhandledrejection', function(event) {
+          var reason = '';
+          try {
+            if (event.reason) {
+              reason = (event.reason.message || '') + ' ' + (event.reason.stack || '') + ' ' + String(event.reason);
+            }
+          } catch(e) {}
+          if (/metamask|chrometransport|connectchrome|inpage\.js|chrome-extension|moz-extension|evmprovider|ethereum/i.test(reason)) {
+            event.preventDefault();
+            event.stopPropagation();
+            if (typeof event.stopImmediatePropagation === 'function') event.stopImmediatePropagation();
+            return true;
+          }
+        }, true);
+      })();
+    </script>
+    <meta name="description" content="A world-class, premium, and highly engaging grocery e-commerce homepage for fresh produce, meats, daily essentials, and quick 15-minute deliveries." />
+    <meta property="og:title" content="কাচা বাজার - Premium Grocery Store" />
+    <meta property="og:description" content="A world-class, premium, and highly engaging grocery e-commerce homepage for fresh produce, meats, daily essentials, and quick 15-minute deliveries." />
+    <title>কাচা বাজার - Premium Grocery Store</title>
+    
+    <!-- PWA & Mobile Web App Meta Tags -->
+    <meta name="theme-color" content="#059669" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="কাচা বাজার" />
+    <meta name="application-name" content="কাচা বাজার" />
+    <meta name="format-detection" content="telephone=no" />
+    
+    <!-- PWA Manifest & Icons -->
+    <link rel="manifest" href="/manifest.json" />
+    <link rel="apple-touch-icon" href="https://res.cloudinary.com/upvkzb3p/image/upload/v1791018865/Gemini_Generated_Image_o7gpz1o7gpz1o7gp_ptkcoo.jpg" />
+    <link rel="icon" type="image/jpeg" href="https://res.cloudinary.com/upvkzb3p/image/upload/v1791018865/Gemini_Generated_Image_o7gpz1o7gpz1o7gp_ptkcoo.jpg" />
+
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Hind+Siliguri:wght@300;400;500;600;700&family=Noto+Sans+Bengali:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
+
